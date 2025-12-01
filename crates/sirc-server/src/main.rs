@@ -17,9 +17,13 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
-    /// Port to listen on
+    /// Port to listen on for clients
     #[arg(long, default_value = "6667")]
     port: u16,
+
+    /// Port for federation connections
+    #[arg(long, default_value = "7000")]
+    fed_port: u16,
 
     /// Server name
     #[arg(long, default_value = "sirc.local")]
@@ -44,17 +48,32 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     info!(
-        "Starting SIRC server {} on {}:{}",
+        "Starting SIRC server '{}' on {}:{}",
         args.name, args.host, args.port
     );
 
-    let server = server::Server::new(args.name, args.host, args.port);
+    let mut server = server::Server::new(args.name.clone(), args.host, args.port);
 
-    if args.federate && !args.peers.is_empty() {
-        info!("Federation enabled with peers: {:?}", args.peers);
-        // TODO: Connect to peers
+    if args.federate {
+        info!("Federation mode enabled");
+        info!("Federation port: {}", args.fed_port);
+
+        // Enable federation
+        server = server.with_federation(args.fed_port);
+
+        // Start federation listener
+        server.start_federation(args.fed_port).await?;
+
+        // Connect to peers if specified
+        if !args.peers.is_empty() {
+            info!("Connecting to {} peer(s): {:?}", args.peers.len(), args.peers);
+            server.connect_to_peers(&args.peers).await?;
+        } else {
+            info!("No peers specified, waiting for incoming connections");
+        }
     }
 
+    info!("Server startup complete, accepting connections");
     server.run().await?;
 
     Ok(())

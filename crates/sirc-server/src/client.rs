@@ -213,11 +213,23 @@ impl ClientHandler {
         for channel_name in channels {
             // Create channel if it doesn't exist
             let mut channels = state.channels.write().await;
-            channels
+            let channel = channels
                 .entry(channel_name.clone())
                 .or_insert_with(|| crate::channel::Channel::new(channel_name.clone()));
 
+            // Add user to channel
+            channel.add_member(nick.clone());
             drop(channels);
+
+            // Notify federation if enabled
+            if let Some(ref federation) = state.federation {
+                if let Err(e) = federation
+                    .join_channel(channel_name.clone(), nick.clone())
+                    .await
+                {
+                    warn!("Failed to federate channel join: {}", e);
+                }
+            }
 
             // Send JOIN confirmation
             let join_msg = Message::with_prefix(

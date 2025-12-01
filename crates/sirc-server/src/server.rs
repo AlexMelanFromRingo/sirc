@@ -1,7 +1,9 @@
 //! Main server implementation
 
 use crate::client::ClientHandler;
+use crate::federation::FederationManager;
 use anyhow::Result;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -12,12 +14,14 @@ pub struct Server {
     host: String,
     port: u16,
     state: Arc<ServerState>,
+    federation: Option<Arc<FederationManager>>,
 }
 
 pub struct ServerState {
     pub name: String,
     pub channels: RwLock<std::collections::HashMap<String, crate::channel::Channel>>,
     pub clients: RwLock<std::collections::HashMap<String, Arc<crate::client::Client>>>,
+    pub federation: Option<Arc<FederationManager>>,
 }
 
 impl Server {
@@ -26,6 +30,7 @@ impl Server {
             name: name.clone(),
             channels: RwLock::new(std::collections::HashMap::new()),
             clients: RwLock::new(std::collections::HashMap::new()),
+            federation: None,
         });
 
         Self {
@@ -33,7 +38,51 @@ impl Server {
             host,
             port,
             state,
+            federation: None,
         }
+    }
+
+    /// Enable federation and return self for chaining
+    pub fn with_federation(mut self, _fed_port: u16) -> Self {
+        let federation = Arc::new(FederationManager::new(self.name.clone()));
+
+        // Update state with federation reference
+        let state = Arc::new(ServerState {
+            name: self.state.name.clone(),
+            channels: RwLock::new(std::collections::HashMap::new()),
+            clients: RwLock::new(std::collections::HashMap::new()),
+            federation: Some(Arc::clone(&federation)),
+        });
+
+        self.state = state;
+        self.federation = Some(federation);
+        self
+    }
+
+    /// Start federation listener
+    pub async fn start_federation(&self, fed_port: u16) -> Result<()> {
+        if let Some(ref federation) = self.federation {
+            let addr = format!("{}:{}", self.host, fed_port)
+                .parse::<SocketAddr>()?;
+            federation.listen(addr).await?;
+            info!("Federation enabled on port {}", fed_port);
+        }
+        Ok(())
+    }
+
+    /// Connect to peer servers
+    pub async fn connect_to_peers(&self, peers: &[String]) -> Result<()> {
+        if let Some(ref federation) = self.federation {
+            for peer in peers {
+                info!("Connecting to peer: {}", peer);
+                if let Err(e) = federation.connect_to_peer(peer).await {
+                    error!("Failed to connect to peer {}: {}", peer, e);
+                } else {
+                    info!("Successfully connected to peer {}", peer);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn run(self) -> Result<()> {
@@ -42,6 +91,10 @@ impl Server {
 
         info!("SIRC server listening on {}", addr);
         info!("Server name: {}", self.name);
+
+        if self.federation.is_some() {
+            info!("Federation mode ENABLED");
+        }
 
         loop {
             match listener.accept().await {
