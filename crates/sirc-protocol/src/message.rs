@@ -87,6 +87,10 @@ pub enum Command {
         target: String,
         encrypted_data: String,
     },
+    /// Message delivery acknowledgment
+    Ack {
+        message_id: String,
+    },
     /// Server federation
     Server {
         name: String,
@@ -320,6 +324,13 @@ impl Message {
                     encrypted_data,
                 })
             }
+            "ACK" => {
+                let message_id = params
+                    .next()
+                    .ok_or(ProtocolError::MissingParameter)?
+                    .to_string();
+                Ok(Command::Ack { message_id })
+            }
             "SERVER" => {
                 let name = params
                     .next()
@@ -421,6 +432,9 @@ impl Message {
                 encrypted_data,
             } => {
                 result.push_str(&format!("EMSG {} :{}", target, encrypted_data));
+            }
+            Command::Ack { message_id } => {
+                result.push_str(&format!("ACK {}", message_id));
             }
             Command::Server {
                 name,

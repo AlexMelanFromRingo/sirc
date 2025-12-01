@@ -5,12 +5,104 @@ use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use sirc_crypto::{EncryptedSession, EncryptedMessage};
 use sirc_protocol::{Command, IrcCodec, Message, Prefix};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
+
+/// Pending message awaiting acknowledgment
+#[derive(Debug, Clone)]
+struct PendingMessage {
+    message_id: String,
+    message: Message,
+    sent_at: Instant,
+    retry_count: u32,
+    target: String,
+}
+
+impl PendingMessage {
+    fn new(message_id: String, message: Message, target: String) -> Self {
+        Self {
+            message_id,
+            message,
+            sent_at: Instant::now(),
+            retry_count: 0,
+            target,
+        }
+    }
+
+    fn is_expired(&self, timeout: Duration) -> bool {
+        self.sent_at.elapsed() > timeout
+    }
+}
+
+/// Delivery confirmation tracker
+pub struct DeliveryTracker {
+    pending: RwLock<HashMap<String, PendingMessage>>,
+    next_id: RwLock<u64>,
+    ack_timeout: Duration,
+    max_retries: u32,
+}
+
+impl DeliveryTracker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: RwLock::new(HashMap::new()),
+            next_id: RwLock::new(0),
+            ack_timeout: Duration::from_secs(5),
+            max_retries: 3,
+        })
+    }
+
+    async fn generate_id(&self) -> String {
+        let mut id = self.next_id.write().await;
+        *id += 1;
+        format!("msg-{}", *id)
+    }
+
+    async fn track_message(&self, message_id: String, message: Message, target: String) {
+        let pending = PendingMessage::new(message_id.clone(), message, target);
+        self.pending.write().await.insert(message_id, pending);
+    }
+
+    async fn confirm(&self, message_id: &str) -> bool {
+        self.pending.write().await.remove(message_id).is_some()
+    }
+
+    async fn check_timeouts(&self) -> Vec<PendingMessage> {
+        let mut expired = Vec::new();
+        let mut pending = self.pending.write().await;
+
+        let mut to_remove = Vec::new();
+        for (id, msg) in pending.iter_mut() {
+            if msg.is_expired(self.ack_timeout) {
+                if msg.retry_count < self.max_retries {
+                    msg.retry_count += 1;
+                    msg.sent_at = Instant::now();
+                    expired.push(msg.clone());
+                } else {
+                    warn!("Message {} to {} failed after {} retries",
+                          id, msg.target, self.max_retries);
+                    to_remove.push(id.clone());
+                }
+            }
+        }
+
+        for id in to_remove {
+            pending.remove(&id);
+        }
+
+        expired
+    }
+
+    async fn pending_count(&self) -> usize {
+        self.pending.read().await.len()
+    }
+}
 
 pub struct Client {
     pub nick: RwLock<Option<String>>,
@@ -18,6 +110,7 @@ pub struct Client {
     pub realname: RwLock<Option<String>>,
     pub session: RwLock<EncryptedSession>,
     pub tx: mpsc::UnboundedSender<Message>,
+    pub delivery_tracker: Arc<DeliveryTracker>,
 }
 
 impl Client {
@@ -28,6 +121,7 @@ impl Client {
             realname: RwLock::new(None),
             session: RwLock::new(EncryptedSession::new()),
             tx,
+            delivery_tracker: DeliveryTracker::new(),
         })
     }
 }
@@ -62,6 +156,9 @@ impl ClientHandler {
         // Send welcome
         Self::send_welcome_msg(&mut framed, &state.name).await?;
 
+        // Timeout checker interval
+        let mut timeout_interval = tokio::time::interval(Duration::from_secs(1));
+
         loop {
             tokio::select! {
                 // Handle incoming messages from client
@@ -87,6 +184,29 @@ impl ClientHandler {
                     if let Err(e) = framed.send(msg).await {
                         warn!("Error sending message: {}", e);
                         break;
+                    }
+                }
+                // Check for message timeouts and retry
+                _ = timeout_interval.tick() => {
+                    let expired = client_with_channel.delivery_tracker.check_timeouts().await;
+                    for pending in expired {
+                        info!("Retrying message {} to {} (attempt {})",
+                              pending.message_id, pending.target, pending.retry_count);
+
+                        // Resend MSGID
+                        let msgid_cmd = Message::new(Command::Raw {
+                            command: "MSGID".to_string(),
+                            params: vec![pending.message_id.clone()],
+                        });
+                        if let Err(e) = framed.send(msgid_cmd).await {
+                            warn!("Failed to resend MSGID: {}", e);
+                            continue;
+                        }
+
+                        // Resend message
+                        if let Err(e) = framed.send(pending.message).await {
+                            warn!("Failed to resend message: {}", e);
+                        }
                     }
                 }
             }
@@ -151,6 +271,19 @@ impl ClientHandler {
                 encrypted_data,
             } => {
                 Self::handle_encrypted_msg(framed, target, encrypted_data, client).await?;
+            }
+            Command::Ack { message_id } => {
+                Self::handle_ack(message_id, client).await?;
+            }
+            Command::Raw { command, params } if command == "MSGID" => {
+                // Automatically send ACK for received message ID
+                if let Some(msg_id) = params.first() {
+                    let ack = Message::new(Command::Ack {
+                        message_id: msg_id.clone(),
+                    });
+                    framed.send(ack).await?;
+                    debug!("Sent ACK for message {}", msg_id);
+                }
             }
             _ => {
                 debug!("Unhandled command: {:?}", message.command);
@@ -290,6 +423,15 @@ impl ClientHandler {
 
         info!("PRIVMSG from {} to {}: {}", nick, target, text);
 
+        // Generate message ID for delivery confirmation
+        let message_id = client.delivery_tracker.generate_id().await;
+
+        // Send MSGID header to all recipients
+        let msgid_cmd = Message::new(Command::Raw {
+            command: "MSGID".to_string(),
+            params: vec![message_id.clone()],
+        });
+
         // Build the message to broadcast
         let msg = Message::with_prefix(
             Prefix::User {
@@ -309,6 +451,7 @@ impl ClientHandler {
             let channels = state.channels.read().await;
             if let Some(channel) = channels.get(&target) {
                 let members = channel.members.clone();
+                let has_recipients = !members.is_empty();
                 drop(channels);
 
                 let clients = state.clients.read().await;
@@ -319,10 +462,25 @@ impl ClientHandler {
                     }
 
                     if let Some(member_client) = clients.get(&member_nick) {
+                        // Send MSGID first
+                        if let Err(e) = member_client.tx.send(msgid_cmd.clone()) {
+                            warn!("Failed to send MSGID to {}: {}", member_nick, e);
+                            continue;
+                        }
+                        // Then send the actual message
                         if let Err(e) = member_client.tx.send(msg.clone()) {
                             warn!("Failed to send to {}: {}", member_nick, e);
                         }
                     }
+                }
+
+                // Track message for confirmation (from first recipient)
+                if has_recipients {
+                    client.delivery_tracker.track_message(
+                        message_id,
+                        msg.clone(),
+                        target.clone()
+                    ).await;
                 }
             } else {
                 // Channel doesn't exist
@@ -339,8 +497,21 @@ impl ClientHandler {
             // Send to specific user
             let clients = state.clients.read().await;
             if let Some(target_client) = clients.get(&target) {
-                if let Err(e) = target_client.tx.send(msg) {
-                    warn!("Failed to send to {}: {}", target, e);
+                // Send MSGID first
+                if let Err(e) = target_client.tx.send(msgid_cmd) {
+                    warn!("Failed to send MSGID to {}: {}", target, e);
+                } else {
+                    // Then send the actual message
+                    if let Err(e) = target_client.tx.send(msg.clone()) {
+                        warn!("Failed to send to {}: {}", target, e);
+                    } else {
+                        // Track message for confirmation
+                        client.delivery_tracker.track_message(
+                            message_id,
+                            msg,
+                            target.clone()
+                        ).await;
+                    }
                 }
             } else {
                 // User not found
@@ -420,6 +591,18 @@ impl ClientHandler {
         });
         framed.send(response).await?;
 
+        Ok(())
+    }
+
+    async fn handle_ack(
+        message_id: String,
+        client: &Arc<Client>,
+    ) -> Result<()> {
+        if client.delivery_tracker.confirm(&message_id).await {
+            debug!("Message {} acknowledged", message_id);
+        } else {
+            warn!("Received ACK for unknown message: {}", message_id);
+        }
         Ok(())
     }
 }
