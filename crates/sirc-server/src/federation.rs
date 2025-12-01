@@ -466,6 +466,29 @@ impl FederationManager {
                 }
             }
 
+            Command::Raw { command, params } if command == "SMSG" => {
+                // Route cross-server message
+                // Format: SMSG <origin_server> <origin_nick> <target> :<text>
+                if params.len() >= 4 {
+                    info!(
+                        "Received SMSG from {} to {}: {}",
+                        params[1], params[2], params[3]
+                    );
+                    // TODO: Deliver to local client if target is local
+                }
+            }
+
+            Command::Raw { command, params: _ } if command == "SPING" => {
+                // Keepalive ping from peer
+                debug!("Received SPING from peer");
+                // Response handled by sender task
+            }
+
+            Command::Raw { command, params: _ } if command == "SPONG" => {
+                // Keepalive pong from peer
+                debug!("Received SPONG from peer");
+            }
+
             _ => {
                 debug!("Unhandled federation message: {:?}", message.command);
             }
@@ -532,6 +555,77 @@ impl FederationManager {
         self.broadcast(fed_msg).await?;
 
         Ok(())
+    }
+
+    /// Send a message to a user (possibly on remote server)
+    pub async fn send_message(
+        &self,
+        origin_nick: &str,
+        target_nick: &str,
+        text: String,
+    ) -> Result<()> {
+        // Check if target is on a known server
+        let channels = self.channels.read().await;
+
+        // Search all channels for the target user
+        for channel_state in channels.values() {
+            if let Some(target_server) = channel_state.users.get(target_nick) {
+                if target_server == &self.local_name {
+                    // Local user - will be handled by server
+                    return Ok(());
+                } else {
+                    // Remote user - route through federation
+                    let fed_msg = FederatedMessage {
+                        origin_server: self.local_name.clone(),
+                        target_server: Some(target_server.clone()),
+                        payload: Message::new(Command::Raw {
+                            command: "SMSG".to_string(),
+                            params: vec![
+                                self.local_name.clone(),
+                                origin_nick.to_string(),
+                                target_nick.to_string(),
+                                format!(":{}", text),
+                            ],
+                        }),
+                    };
+
+                    self.route_to(target_server, fed_msg).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // User not found in any channel
+        warn!("Target user {} not found in federation", target_nick);
+        Ok(())
+    }
+
+    /// Send keepalive ping to all peers
+    pub async fn send_keepalive(&self) -> Result<()> {
+        let ping_msg = FederatedMessage {
+            origin_server: self.local_name.clone(),
+            target_server: None,
+            payload: Message::new(Command::Raw {
+                command: "SPING".to_string(),
+                params: vec![self.local_name.clone()],
+            }),
+        };
+
+        self.broadcast(ping_msg).await?;
+        Ok(())
+    }
+
+    /// Start keepalive task (call once during server initialization)
+    pub fn start_keepalive_task(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.send_keepalive().await {
+                    error!("Failed to send keepalive: {}", e);
+                }
+            }
+        });
     }
 }
 

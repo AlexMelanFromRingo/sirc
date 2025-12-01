@@ -50,3 +50,7 @@ crossterm = "0.28"
 
 # Testing
 criterion = "0.5"
+
+# Utilities
+dirs = "5.0"
+tempfile = "3.13"

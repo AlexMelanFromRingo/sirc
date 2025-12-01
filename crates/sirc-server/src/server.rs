@@ -66,6 +66,10 @@ impl Server {
                 .parse::<SocketAddr>()?;
             federation.listen(addr).await?;
             info!("Federation enabled on port {}", fed_port);
+
+            // Start keepalive task
+            Arc::clone(federation).start_keepalive_task();
+            info!("Keepalive task started (30s interval)");
         }
         Ok(())
     }

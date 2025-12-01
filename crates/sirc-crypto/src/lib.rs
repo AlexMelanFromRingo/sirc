@@ -5,6 +5,8 @@
 //! - ChaCha20-Poly1305 for AEAD encryption
 //! - BLAKE3 for key derivation
 
+pub mod keystore;
+
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
@@ -55,6 +57,11 @@ impl KeyPair {
     /// Get public key as bytes
     pub fn public_bytes(&self) -> &[u8; 32] {
         self.public.as_bytes()
+    }
+
+    /// Get secret key bytes (for serialization only)
+    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// Perform Diffie-Hellman key exchange
@@ -188,9 +195,23 @@ impl EncryptedSession {
         }
     }
 
+    /// Create session from existing keypair
+    pub fn from_keypair(keypair: KeyPair) -> Self {
+        Self {
+            local_keypair: keypair,
+            remote_public: None,
+            shared_key: None,
+        }
+    }
+
     /// Get local public key
     pub fn public_key(&self) -> &PublicKey {
         &self.local_keypair.public
+    }
+
+    /// Get reference to keypair (for persistence)
+    pub fn keypair(&self) -> &KeyPair {
+        &self.local_keypair
     }
 
     /// Set remote public key and derive shared secret
