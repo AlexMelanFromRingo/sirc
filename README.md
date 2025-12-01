@@ -119,11 +119,11 @@ BURST / BURST_END                # State synchronization
 - [x] **Persistent key storage** (saved to ~/.sirc/)
 - [x] **Keepalive mechanism** (SPING/SPONG every 30s)
 - [x] **Auto-reconnect for peers** (exponential backoff, max 10 retries)
+- [x] **Split brain detection and healing** (120s timeout, automatic resync)
+- [x] **Performance metrics dashboard** (messages, connections, latency, partitions)
 
 ### 🚧 In Development
 - [ ] Perfect Forward Secrecy (key rotation)
-- [ ] Split brain detection and healing
-- [ ] Performance metrics dashboard
 - [ ] Mobile/web clients
 
 ## Development Status
@@ -139,12 +139,13 @@ BURST / BURST_END                # State synchronization
 - Cross-server private messaging ✅
 - TLS server authentication and encryption ✅
 - Auto-reconnect with exponential backoff ✅
+- Split brain detection and automatic healing ✅
+- Comprehensive performance metrics ✅
 
 ### What's Next
-- Split brain detection and healing
-- Performance metrics and monitoring
+- Perfect Forward Secrecy (key rotation)
 - Advanced routing algorithms
-- Perfect Forward Secrecy
+- Mobile/web clients
 
 ## Testing
 

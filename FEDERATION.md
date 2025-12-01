@@ -211,13 +211,14 @@ Server A knows:
 - [x] **Automatic reconnection after disconnect** (exponential backoff)
 - [x] **Server authentication (TLS certificates)**
 - [x] **Encrypted server-to-server links (TLS 1.3)**
+- [x] **Split brain detection and healing** (120s timeout, automatic resync)
+- [x] **Performance metrics** (messages, connections, latency, partitions)
 
 ### 🚧 In Development
 
-- [ ] Server split detection and healing
 - [ ] Message delivery confirmations
-- [ ] Performance metrics dashboard
 - [ ] Certificate revocation (CRL/OCSP)
+- [ ] Advanced routing optimization
 
 ## Advanced Configuration
 

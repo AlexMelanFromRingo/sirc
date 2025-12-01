@@ -13,7 +13,7 @@ use sirc_protocol::{Command, IrcCodec, Message};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
@@ -22,6 +22,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use crate::tls::TlsManager;
+use crate::metrics::MetricsCollector;
 
 /// Stream wrapper that supports both TLS and plain TCP
 enum FederationStream {
@@ -95,6 +96,9 @@ pub struct PeerConfig {
     pub retry_count: u32,
     pub max_retries: u32,
     pub connected: bool,
+    pub last_seen: Instant,
+    pub last_ping_sent: Option<Instant>,
+    pub last_pong_received: Option<Instant>,
 }
 
 impl PeerConfig {
@@ -104,6 +108,9 @@ impl PeerConfig {
             retry_count: 0,
             max_retries: 10, // Max reconnection attempts
             connected: false,
+            last_seen: Instant::now(),
+            last_ping_sent: None,
+            last_pong_received: None,
         }
     }
 
@@ -111,6 +118,35 @@ impl PeerConfig {
         // Exponential backoff: 2^n seconds, capped at 5 minutes
         let seconds = 2u64.pow(self.retry_count.min(8));
         Duration::from_secs(seconds.min(300))
+    }
+
+    fn is_stale(&self, timeout: Duration) -> bool {
+        self.last_seen.elapsed() > timeout
+    }
+
+    fn update_last_seen(&mut self) {
+        self.last_seen = Instant::now();
+    }
+}
+
+/// Network partition tracking
+#[derive(Debug, Clone)]
+pub struct NetworkPartition {
+    /// Servers that are unreachable
+    pub unreachable_servers: HashSet<String>,
+    /// When the partition was detected
+    pub detected_at: Instant,
+    /// Partition identifier
+    pub id: String,
+}
+
+impl NetworkPartition {
+    fn new(id: String, unreachable_servers: HashSet<String>) -> Self {
+        Self {
+            unreachable_servers,
+            detected_at: Instant::now(),
+            id,
+        }
     }
 }
 
@@ -189,6 +225,8 @@ pub struct FederationManager {
     routing: Arc<RwLock<RoutingTable>>,
     channels: Arc<RwLock<HashMap<String, ChannelState>>>,
     peers: Arc<RwLock<HashMap<String, PeerConfig>>>,
+    partitions: Arc<RwLock<Vec<NetworkPartition>>>,
+    metrics: Arc<MetricsCollector>,
     tls: Option<Arc<TlsManager>>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
@@ -213,12 +251,30 @@ impl FederationManager {
             routing: Arc::new(RwLock::new(RoutingTable::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
+            partitions: Arc::new(RwLock::new(Vec::new())),
+            metrics: MetricsCollector::new(),
             tls: None,
             tls_acceptor: None,
             tls_connector: None,
             message_rx: rx,
             message_tx: tx,
         }
+    }
+
+    /// Get metrics collector reference
+    pub fn metrics(&self) -> Arc<MetricsCollector> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Start metrics reporting task
+    pub fn start_metrics_reporting(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                interval.tick().await;
+                self.metrics.print_summary().await;
+            }
+        });
     }
 
     /// Enable TLS for secure federation
@@ -934,6 +990,110 @@ impl FederationManager {
                     }
                 }
             }
+        }
+    }
+
+    /// Start split brain detection task
+    pub fn start_split_brain_detection(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                self.detect_and_heal_partitions().await;
+            }
+        });
+    }
+
+    /// Detect network partitions and heal them
+    async fn detect_and_heal_partitions(&self) {
+        const PARTITION_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
+
+        let mut unreachable_peers = HashSet::new();
+        let mut healed_peers = HashSet::new();
+
+        // Check for stale peers
+        {
+            let peers = self.peers.read().await;
+            for (address, config) in peers.iter() {
+                if config.connected && config.is_stale(PARTITION_TIMEOUT) {
+                    warn!("Peer {} appears unreachable (no activity for {}s)",
+                          address, PARTITION_TIMEOUT.as_secs());
+                    unreachable_peers.insert(address.clone());
+                }
+            }
+        }
+
+        // Check existing partitions for healing
+        {
+            let mut partitions = self.partitions.write().await;
+            let mut healed_partitions = Vec::new();
+
+            for (idx, partition) in partitions.iter().enumerate() {
+                let mut all_healed = true;
+
+                for server in &partition.unreachable_servers {
+                    if let Some(config) = self.peers.read().await.get(server) {
+                        if config.connected && !config.is_stale(PARTITION_TIMEOUT) {
+                            healed_peers.insert(server.clone());
+                        } else {
+                            all_healed = false;
+                        }
+                    }
+                }
+
+                if all_healed {
+                    healed_partitions.push(idx);
+                    info!("Network partition {} has healed after {:?}",
+                          partition.id, partition.detected_at.elapsed());
+                }
+            }
+
+            // Remove healed partitions (in reverse order to maintain indices)
+            for idx in healed_partitions.into_iter().rev() {
+                partitions.remove(idx);
+            }
+        }
+
+        // Create new partition if we have unreachable peers
+        if !unreachable_peers.is_empty() {
+            let partition_id = format!("partition-{}", Instant::now().elapsed().as_secs());
+            let partition = NetworkPartition::new(partition_id.clone(), unreachable_peers.clone());
+
+            error!(
+                "Network partition detected: {} - {} servers unreachable: {:?}",
+                partition_id,
+                unreachable_peers.len(),
+                unreachable_peers
+            );
+
+            self.metrics.increment_partitions_detected();
+            self.partitions.write().await.push(partition);
+        }
+
+        // Trigger state resynchronization for healed peers
+        if !healed_peers.is_empty() {
+            info!("Triggering state resync for healed peers: {:?}", healed_peers);
+            self.metrics.increment_partitions_healed();
+
+            for peer_address in healed_peers {
+                // Update last_seen timestamp
+                if let Some(config) = self.peers.write().await.get_mut(&peer_address) {
+                    config.update_last_seen();
+                }
+            }
+        }
+    }
+
+    /// Get current network partition status
+    pub async fn get_partition_status(&self) -> Vec<NetworkPartition> {
+        self.partitions.read().await.clone()
+    }
+
+    /// Update peer activity timestamp (called on receiving SPONG)
+    pub async fn update_peer_activity(&self, peer_address: &str) {
+        if let Some(config) = self.peers.write().await.get_mut(peer_address) {
+            config.update_last_seen();
+            config.last_pong_received = Some(Instant::now());
         }
     }
 }

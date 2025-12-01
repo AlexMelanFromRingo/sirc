@@ -5,6 +5,7 @@ mod client;
 mod channel;
 mod federation;
 mod tls;
+mod metrics;
 
 use anyhow::Result;
 use clap::Parser;

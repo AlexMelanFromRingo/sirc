@@ -76,6 +76,14 @@ impl Server {
             // Start auto-reconnect task
             Arc::clone(federation).start_reconnect_task();
             info!("Auto-reconnect task started (5s check interval)");
+
+            // Start split brain detection
+            Arc::clone(federation).start_split_brain_detection();
+            info!("Split brain detection started (60s check interval)");
+
+            // Start metrics reporting
+            Arc::clone(federation).start_metrics_reporting();
+            info!("Performance metrics reporting started (5min interval)");
         }
         Ok(())
     }
