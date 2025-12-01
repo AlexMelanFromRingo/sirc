@@ -122,10 +122,10 @@ BURST / BURST_END                # State synchronization
 - [x] **Split brain detection and healing** (120s timeout, automatic resync)
 - [x] **Performance metrics dashboard** (messages, connections, latency, partitions)
 - [x] **Message delivery confirmations** (ACK protocol with automatic retry)
+- [x] **Certificate Revocation List (CRL)** (automatic checking during TLS handshake)
 
 ### 🚧 In Development
 - [ ] Perfect Forward Secrecy (key rotation)
-- [ ] Certificate revocation (CRL/OCSP)
 - [ ] Mobile/web clients
 
 ## Development Status
@@ -144,10 +144,10 @@ BURST / BURST_END                # State synchronization
 - Split brain detection and automatic healing ✅
 - Comprehensive performance metrics ✅
 - Message delivery confirmations with ACK ✅
+- Certificate Revocation List (CRL) ✅
 
 ### What's Next
 - Perfect Forward Secrecy (key rotation)
-- Certificate revocation (CRL/OCSP)
 - Advanced routing algorithms
 - Mobile/web clients
 

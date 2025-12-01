@@ -214,10 +214,10 @@ Server A knows:
 - [x] **Split brain detection and healing** (120s timeout, automatic resync)
 - [x] **Performance metrics** (messages, connections, latency, partitions)
 - [x] **Message delivery confirmations** (ACK protocol, 5s timeout, auto-retry)
+- [x] **Certificate Revocation List (CRL)** (automatic checking, persistent storage)
 
 ### 🚧 In Development
 
-- [ ] Certificate revocation (CRL/OCSP)
 - [ ] Advanced routing optimization
 
 ## Advanced Configuration
