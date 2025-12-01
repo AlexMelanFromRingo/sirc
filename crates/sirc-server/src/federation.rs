@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use sirc_protocol::{Command, IrcCodec, Message};
+use sirc_protocol::{Command, IrcCodec, Message, Prefix};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -232,6 +232,7 @@ pub struct FederationManager {
     tls_connector: Option<TlsConnector>,
     message_rx: mpsc::UnboundedReceiver<FederatedMessage>,
     message_tx: mpsc::UnboundedSender<FederatedMessage>,
+    clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
 }
 
 /// Federated channel state
@@ -243,7 +244,10 @@ pub struct ChannelState {
 }
 
 impl FederationManager {
-    pub fn new(local_name: String) -> Self {
+    pub fn new(
+        local_name: String,
+        clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
 
         Self {
@@ -258,6 +262,7 @@ impl FederationManager {
             tls_connector: None,
             message_rx: rx,
             message_tx: tx,
+            clients,
         }
     }
 
@@ -312,6 +317,7 @@ impl FederationManager {
 
         let routing = Arc::clone(&self.routing);
         let channels = Arc::clone(&self.channels);
+        let clients = Arc::clone(&self.clients);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
         let tls_acceptor = self.tls_acceptor.clone();
@@ -323,6 +329,7 @@ impl FederationManager {
                         info!("Incoming federation connection from {}", addr);
                         let routing = Arc::clone(&routing);
                         let channels = Arc::clone(&channels);
+                        let clients = Arc::clone(&clients);
                         let local_name = local_name.clone();
                         let message_tx = message_tx.clone();
                         let tls_acceptor = tls_acceptor.clone();
@@ -349,6 +356,7 @@ impl FederationManager {
                                 addr,
                                 routing,
                                 channels,
+                                clients,
                                 local_name,
                                 message_tx,
                             )
@@ -403,6 +411,7 @@ impl FederationManager {
 
         let routing = Arc::clone(&self.routing);
         let channels = Arc::clone(&self.channels);
+        let clients = Arc::clone(&self.clients);
         let peers = Arc::clone(&self.peers);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
@@ -414,6 +423,7 @@ impl FederationManager {
                 addr,
                 routing,
                 channels,
+                clients,
                 local_name,
                 message_tx,
             )
@@ -444,6 +454,7 @@ impl FederationManager {
         addr: SocketAddr,
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
+        clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
         local_name: String,
         _message_tx: mpsc::UnboundedSender<FederatedMessage>,
     ) -> Result<()> {
@@ -504,7 +515,7 @@ impl FederationManager {
                 while let Some(result) = reader.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_peer_message(message, &routing, &channels).await?;
+                            Self::handle_peer_message(message, &routing, &channels, &clients).await?;
                         }
                         Err(e) => {
                             warn!("Error receiving from peer: {}", e);
@@ -524,6 +535,7 @@ impl FederationManager {
         addr: SocketAddr,
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
+        clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
         local_name: String,
         _message_tx: mpsc::UnboundedSender<FederatedMessage>,
     ) -> Result<()> {
@@ -564,7 +576,7 @@ impl FederationManager {
                     if Self::is_burst_end(&msg) {
                         break;
                     }
-                    Self::handle_peer_message(msg, &routing, &channels).await?;
+                    Self::handle_peer_message(msg, &routing, &channels, &clients).await?;
                 }
 
                 // Send our BURST
@@ -589,7 +601,7 @@ impl FederationManager {
                 while let Some(result) = reader.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_peer_message(message, &routing, &channels).await?;
+                            Self::handle_peer_message(message, &routing, &channels, &clients).await?;
                         }
                         Err(e) => {
                             warn!("Error from peer: {}", e);
@@ -653,6 +665,7 @@ impl FederationManager {
         message: Message,
         routing: &Arc<RwLock<RoutingTable>>,
         channels: &Arc<RwLock<HashMap<String, ChannelState>>>,
+        clients: &Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
     ) -> Result<()> {
         debug!("Federation message: {:?}", message.command);
 
@@ -703,11 +716,40 @@ impl FederationManager {
                 // Route cross-server message
                 // Format: SMSG <origin_server> <origin_nick> <target> :<text>
                 if params.len() >= 4 {
+                    let origin_server = &params[0];
+                    let origin_nick = &params[1];
+                    let target = &params[2];
+                    let text = &params[3];
+
                     info!(
-                        "Received SMSG from {} to {}: {}",
-                        params[1], params[2], params[3]
+                        "Received SMSG from {}@{} to {}: {}",
+                        origin_nick, origin_server, target, text
                     );
-                    // TODO: Deliver to local client if target is local
+
+                    // Deliver to local client if target is local
+                    let clients_lock = clients.read().await;
+                    if let Some(target_client) = clients_lock.get(target) {
+                        // Create PRIVMSG from origin user
+                        let msg = Message::with_prefix(
+                            Prefix::User {
+                                nick: origin_nick.clone(),
+                                user: Some(origin_nick.clone()),
+                                host: Some(origin_server.clone()),
+                            },
+                            Command::PrivMsg {
+                                target: target.clone(),
+                                text: text.clone(),
+                            },
+                        );
+
+                        if let Err(e) = target_client.tx.send(msg) {
+                            warn!("Failed to deliver SMSG to local client {}: {}", target, e);
+                        } else {
+                            debug!("Delivered SMSG to local client {}", target);
+                        }
+                    } else {
+                        debug!("Target {} not found locally, may be on another server", target);
+                    }
                 }
             }
 
@@ -950,6 +992,7 @@ impl FederationManager {
 
                     let routing = Arc::clone(&self.routing);
                     let channels = Arc::clone(&self.channels);
+                    let clients = Arc::clone(&self.clients);
                     let peers = Arc::clone(&self.peers);
                     let local_name = self.local_name.clone();
                     let message_tx = self.message_tx.clone();
@@ -962,6 +1005,7 @@ impl FederationManager {
                             addr,
                             routing,
                             channels,
+                            clients,
                             local_name,
                             message_tx,
                         )

@@ -3,7 +3,7 @@
 use crate::server::ServerState;
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
-use sirc_crypto::{EncryptedSession, EncryptedMessage};
+use sirc_crypto::EncryptedSession;
 use sirc_protocol::{Command, IrcCodec, Message, Prefix};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -270,7 +270,7 @@ impl ClientHandler {
                 target,
                 encrypted_data,
             } => {
-                Self::handle_encrypted_msg(framed, target, encrypted_data, client).await?;
+                Self::handle_encrypted_msg(framed, target, encrypted_data, client, state).await?;
             }
             Command::Ack { message_id } => {
                 Self::handle_ack(message_id, client).await?;
@@ -560,36 +560,42 @@ impl ClientHandler {
     }
 
     async fn handle_encrypted_msg(
-        framed: &mut Framed<TcpStream, IrcCodec>,
+        _framed: &mut Framed<TcpStream, IrcCodec>,
         target: String,
         encrypted_data: String,
         client: &Arc<Client>,
+        state: &Arc<ServerState>,
     ) -> Result<()> {
-        let session = client.session.read().await;
-
-        if !session.is_ready() {
-            warn!("Encryption session not ready");
-            return Ok(());
-        }
-
-        // Decrypt message
-        let encrypted_msg = EncryptedMessage::from_base64(&encrypted_data)?;
-        let plaintext = session.decrypt(&encrypted_msg)?;
-        let text = String::from_utf8(plaintext)?;
-
-        info!("Decrypted message to {}: {}", target, text);
-
-        // Echo back encrypted (TODO: route to actual target)
         let nick = client.nick.read().await.clone().unwrap_or_default();
-        let response_text = format!("Encrypted message received: {}", text);
-        let encrypted_response = session.encrypt(response_text.as_bytes())?;
-        let encoded = encrypted_response.to_base64()?;
 
-        let response = Message::new(Command::EMsg {
-            target: nick,
-            encrypted_data: encoded,
-        });
-        framed.send(response).await?;
+        info!("Routing encrypted message from {} to {}", nick, target);
+
+        // For true E2E encryption, server should NOT decrypt
+        // Simply route the encrypted message to the target client
+        let msg = Message::with_prefix(
+            Prefix::User {
+                nick: nick.clone(),
+                user: client.username.read().await.clone(),
+                host: Some("localhost".to_string()),
+            },
+            Command::EMsg {
+                target: target.clone(),
+                encrypted_data,
+            },
+        );
+
+        // Route to target client
+        let clients = state.clients.read().await;
+        if let Some(target_client) = clients.get(&target) {
+            if let Err(e) = target_client.tx.send(msg) {
+                warn!("Failed to route encrypted message to {}: {}", target, e);
+            } else {
+                debug!("Routed encrypted message from {} to {}", nick, target);
+            }
+        } else {
+            // Target not found
+            warn!("Encrypted message target {} not found", target);
+        }
 
         Ok(())
     }

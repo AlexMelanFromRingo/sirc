@@ -20,7 +20,7 @@ pub struct Server {
 pub struct ServerState {
     pub name: String,
     pub channels: RwLock<std::collections::HashMap<String, crate::channel::Channel>>,
-    pub clients: RwLock<std::collections::HashMap<String, Arc<crate::client::Client>>>,
+    pub clients: Arc<RwLock<std::collections::HashMap<String, Arc<crate::client::Client>>>>,
     pub federation: Option<Arc<FederationManager>>,
 }
 
@@ -29,7 +29,7 @@ impl Server {
         let state = Arc::new(ServerState {
             name: name.clone(),
             channels: RwLock::new(std::collections::HashMap::new()),
-            clients: RwLock::new(std::collections::HashMap::new()),
+            clients: Arc::new(RwLock::new(std::collections::HashMap::new())),
             federation: None,
         });
 
@@ -44,7 +44,13 @@ impl Server {
 
     /// Enable federation and return self for chaining
     pub fn with_federation(mut self, _fed_port: u16, enable_tls: bool) -> Result<Self> {
-        let federation_mgr = FederationManager::new(self.name.clone());
+        // Reuse the clients HashMap from the existing state
+        let clients = Arc::clone(&self.state.clients);
+
+        let federation_mgr = FederationManager::new(
+            self.name.clone(),
+            Arc::clone(&clients),
+        );
         let federation_mgr = federation_mgr.with_tls(enable_tls)?;
         let federation = Arc::new(federation_mgr);
 
@@ -52,7 +58,7 @@ impl Server {
         let state = Arc::new(ServerState {
             name: self.state.name.clone(),
             channels: RwLock::new(std::collections::HashMap::new()),
-            clients: RwLock::new(std::collections::HashMap::new()),
+            clients,
             federation: Some(Arc::clone(&federation)),
         });
 
