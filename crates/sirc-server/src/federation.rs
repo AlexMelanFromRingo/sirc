@@ -13,10 +13,72 @@ use sirc_protocol::{Command, IrcCodec, Message};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
+
+use crate::tls::TlsManager;
+
+/// Stream wrapper that supports both TLS and plain TCP
+enum FederationStream {
+    Plain(TcpStream),
+    TlsServer(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    TlsClient(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for FederationStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            FederationStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            FederationStream::TlsServer(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            FederationStream::TlsClient(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for FederationStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            FederationStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            FederationStream::TlsServer(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            FederationStream::TlsClient(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            FederationStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            FederationStream::TlsServer(s) => std::pin::Pin::new(s).poll_flush(cx),
+            FederationStream::TlsClient(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            FederationStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            FederationStream::TlsServer(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            FederationStream::TlsClient(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Federated message for routing between servers
 #[derive(Debug, Clone)]
@@ -24,6 +86,32 @@ pub struct FederatedMessage {
     pub origin_server: String,
     pub target_server: Option<String>, // None = broadcast
     pub payload: Message,
+}
+
+/// Peer configuration for auto-reconnect
+#[derive(Debug, Clone)]
+pub struct PeerConfig {
+    pub address: String,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub connected: bool,
+}
+
+impl PeerConfig {
+    fn new(address: String) -> Self {
+        Self {
+            address,
+            retry_count: 0,
+            max_retries: 10, // Max reconnection attempts
+            connected: false,
+        }
+    }
+
+    fn backoff_duration(&self) -> Duration {
+        // Exponential backoff: 2^n seconds, capped at 5 minutes
+        let seconds = 2u64.pow(self.retry_count.min(8));
+        Duration::from_secs(seconds.min(300))
+    }
 }
 
 /// Peer server connection
@@ -100,6 +188,10 @@ pub struct FederationManager {
     local_name: String,
     routing: Arc<RwLock<RoutingTable>>,
     channels: Arc<RwLock<HashMap<String, ChannelState>>>,
+    peers: Arc<RwLock<HashMap<String, PeerConfig>>>,
+    tls: Option<Arc<TlsManager>>,
+    tls_acceptor: Option<TlsAcceptor>,
+    tls_connector: Option<TlsConnector>,
     message_rx: mpsc::UnboundedReceiver<FederatedMessage>,
     message_tx: mpsc::UnboundedSender<FederatedMessage>,
 }
@@ -120,9 +212,35 @@ impl FederationManager {
             local_name,
             routing: Arc::new(RwLock::new(RoutingTable::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            tls: None,
+            tls_acceptor: None,
+            tls_connector: None,
             message_rx: rx,
             message_tx: tx,
         }
+    }
+
+    /// Enable TLS for secure federation
+    pub fn with_tls(mut self, enable: bool) -> Result<Self> {
+        if !enable {
+            return Ok(self);
+        }
+
+        let tls_manager = Arc::new(TlsManager::new(&self.local_name));
+        tls_manager.load_or_generate(&self.local_name)?;
+
+        let server_config = tls_manager.server_config()?;
+        let client_config = tls_manager.client_config(true)?; // Trust all for now
+
+        let fingerprint = tls_manager.fingerprint()?;
+        info!("TLS enabled for federation. Certificate fingerprint: {}", &fingerprint[..16]);
+
+        self.tls = Some(tls_manager);
+        self.tls_acceptor = Some(TlsAcceptor::from(server_config));
+        self.tls_connector = Some(TlsConnector::from(client_config));
+
+        Ok(self)
     }
 
     /// Get a message sender for other components
@@ -133,12 +251,14 @@ impl FederationManager {
     /// Start federation listener
     pub async fn listen(&self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        info!("Federation listener started on {}", addr);
+        let tls_enabled = self.tls.is_some();
+        info!("Federation listener started on {} (TLS: {})", addr, tls_enabled);
 
         let routing = Arc::clone(&self.routing);
         let channels = Arc::clone(&self.channels);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
+        let tls_acceptor = self.tls_acceptor.clone();
 
         tokio::spawn(async move {
             loop {
@@ -149,10 +269,27 @@ impl FederationManager {
                         let channels = Arc::clone(&channels);
                         let local_name = local_name.clone();
                         let message_tx = message_tx.clone();
+                        let tls_acceptor = tls_acceptor.clone();
 
                         tokio::spawn(async move {
+                            // Wrap with TLS if enabled
+                            let stream = if let Some(acceptor) = tls_acceptor {
+                                match acceptor.accept(socket).await {
+                                    Ok(tls_stream) => {
+                                        info!("TLS handshake completed with {}", addr);
+                                        FederationStream::TlsServer(Box::new(tls_stream))
+                                    }
+                                    Err(e) => {
+                                        error!("TLS handshake failed with {}: {}", addr, e);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                FederationStream::Plain(socket)
+                            };
+
                             if let Err(e) = Self::handle_incoming_peer(
-                                socket,
+                                stream,
                                 addr,
                                 routing,
                                 channels,
@@ -179,13 +316,41 @@ impl FederationManager {
     pub async fn connect_to_peer(&self, address: &str) -> Result<()> {
         info!("Connecting to peer at {}", address);
 
-        let stream = TcpStream::connect(address).await?;
-        let addr = stream.peer_addr()?;
+        // Store peer config for reconnection
+        self.peers.write().await.insert(
+            address.to_string(),
+            PeerConfig::new(address.to_string()),
+        );
+
+        let tcp_stream = TcpStream::connect(address).await?;
+        let addr = tcp_stream.peer_addr()?;
+
+        // Wrap with TLS if enabled
+        let stream = if let Some(ref connector) = self.tls_connector {
+            let server_name = rustls::pki_types::ServerName::try_from(
+                address.split(':').next().unwrap_or("localhost").to_string()
+            )?;
+
+            match connector.connect(server_name, tcp_stream).await {
+                Ok(tls_stream) => {
+                    info!("TLS handshake completed with {}", address);
+                    FederationStream::TlsClient(Box::new(tls_stream))
+                }
+                Err(e) => {
+                    error!("TLS handshake failed with {}: {}", address, e);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            FederationStream::Plain(tcp_stream)
+        };
 
         let routing = Arc::clone(&self.routing);
         let channels = Arc::clone(&self.channels);
+        let peers = Arc::clone(&self.peers);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
+        let peer_address = address.to_string();
 
         tokio::spawn(async move {
             if let Err(e) = Self::handle_outgoing_peer(
@@ -198,16 +363,28 @@ impl FederationManager {
             )
             .await
             {
-                error!("Error handling outgoing peer: {}", e);
+                error!("Error handling outgoing peer {}: {}", peer_address, e);
+
+                // Mark peer as disconnected
+                if let Some(config) = peers.write().await.get_mut(&peer_address) {
+                    config.connected = false;
+                    info!("Peer {} marked for reconnection", peer_address);
+                }
             }
         });
+
+        // Mark as connected after successful initial connection
+        if let Some(config) = self.peers.write().await.get_mut(address) {
+            config.connected = true;
+            config.retry_count = 0;
+        }
 
         Ok(())
     }
 
     /// Handle incoming peer connection
     async fn handle_incoming_peer(
-        socket: TcpStream,
+        socket: FederationStream,
         addr: SocketAddr,
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
@@ -287,7 +464,7 @@ impl FederationManager {
 
     /// Handle outgoing peer connection
     async fn handle_outgoing_peer(
-        socket: TcpStream,
+        socket: FederationStream,
         addr: SocketAddr,
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
@@ -372,7 +549,7 @@ impl FederationManager {
 
     /// Send BURST (initial state sync)
     async fn send_burst(
-        framed: &mut Framed<TcpStream, IrcCodec>,
+        framed: &mut Framed<FederationStream, IrcCodec>,
         channels: &Arc<RwLock<HashMap<String, ChannelState>>>,
     ) -> Result<()> {
         let channels_lock = channels.read().await;
@@ -408,7 +585,7 @@ impl FederationManager {
 
     /// Send a federated message
     async fn send_federated_message(
-        framed: &mut Framed<TcpStream, IrcCodec>,
+        framed: &mut Framed<FederationStream, IrcCodec>,
         msg: FederatedMessage,
     ) -> Result<()> {
         framed.send(msg.payload).await?;
@@ -626,6 +803,138 @@ impl FederationManager {
                 }
             }
         });
+    }
+
+    /// Start auto-reconnect task (call once during server initialization)
+    pub fn start_reconnect_task(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                self.check_and_reconnect().await;
+            }
+        });
+    }
+
+    /// Check for disconnected peers and attempt reconnection
+    async fn check_and_reconnect(&self) {
+        let mut peers_to_reconnect = Vec::new();
+
+        // Find disconnected peers
+        {
+            let peers = self.peers.read().await;
+            for (address, config) in peers.iter() {
+                if !config.connected && config.retry_count < config.max_retries {
+                    peers_to_reconnect.push(address.clone());
+                }
+            }
+        }
+
+        // Attempt reconnection with backoff
+        for address in peers_to_reconnect {
+            let backoff = {
+                let peers = self.peers.read().await;
+                if let Some(config) = peers.get(&address) {
+                    config.backoff_duration()
+                } else {
+                    continue;
+                }
+            };
+
+            // Wait for backoff period
+            sleep(backoff).await;
+
+            // Increment retry count
+            if let Some(config) = self.peers.write().await.get_mut(&address) {
+                config.retry_count += 1;
+                info!(
+                    "Attempting to reconnect to {} (attempt {}/{})",
+                    address, config.retry_count, config.max_retries
+                );
+            }
+
+            // Attempt reconnection
+            match TcpStream::connect(&address).await {
+                Ok(tcp_stream) => {
+                    info!("Successfully reconnected to {}", address);
+
+                    let addr = match tcp_stream.peer_addr() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+
+                    // Wrap with TLS if enabled
+                    let stream = if let Some(ref connector) = self.tls_connector {
+                        let server_name = match rustls::pki_types::ServerName::try_from(
+                            address.split(':').next().unwrap_or("localhost").to_string()
+                        ) {
+                            Ok(name) => name,
+                            Err(_) => continue,
+                        };
+
+                        match connector.connect(server_name, tcp_stream).await {
+                            Ok(tls_stream) => {
+                                info!("TLS handshake completed on reconnection to {}", address);
+                                FederationStream::TlsClient(Box::new(tls_stream))
+                            }
+                            Err(e) => {
+                                error!("TLS handshake failed on reconnection to {}: {}", address, e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        FederationStream::Plain(tcp_stream)
+                    };
+
+                    // Reset retry count on success
+                    if let Some(config) = self.peers.write().await.get_mut(&address) {
+                        config.connected = true;
+                        config.retry_count = 0;
+                    }
+
+                    let routing = Arc::clone(&self.routing);
+                    let channels = Arc::clone(&self.channels);
+                    let peers = Arc::clone(&self.peers);
+                    let local_name = self.local_name.clone();
+                    let message_tx = self.message_tx.clone();
+                    let peer_address = address.clone();
+
+                    // Spawn handler task
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::handle_outgoing_peer(
+                            stream,
+                            addr,
+                            routing,
+                            channels,
+                            local_name,
+                            message_tx,
+                        )
+                        .await
+                        {
+                            error!("Error after reconnecting to {}: {}", peer_address, e);
+
+                            // Mark as disconnected again
+                            if let Some(config) = peers.write().await.get_mut(&peer_address) {
+                                config.connected = false;
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to reconnect to {}: {}", address, e);
+
+                    // Check if max retries reached
+                    if let Some(config) = self.peers.read().await.get(&address) {
+                        if config.retry_count >= config.max_retries {
+                            error!(
+                                "Max reconnection attempts reached for {}. Giving up.",
+                                address
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

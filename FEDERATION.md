@@ -205,16 +205,19 @@ Server A knows:
 - [x] Mesh topology support
 - [x] Automatic peer discovery
 - [x] Channel state federation
+- [x] **Cross-server messaging (SMSG)**
+- [x] **Keepalive mechanism (SPING/SPONG)**
+- [x] **Persistent key storage**
+- [x] **Automatic reconnection after disconnect** (exponential backoff)
+- [x] **Server authentication (TLS certificates)**
+- [x] **Encrypted server-to-server links (TLS 1.3)**
 
 ### 🚧 In Development
 
-- [ ] User-to-user messaging across servers
-- [ ] Private message routing
-- [ ] Server keepalive (SPING/SPONG)
-- [ ] Server split detection
-- [ ] Automatic reconnection
-- [ ] Server authentication
-- [ ] Encrypted server-to-server links
+- [ ] Server split detection and healing
+- [ ] Message delivery confirmations
+- [ ] Performance metrics dashboard
+- [ ] Certificate revocation (CRL/OCSP)
 
 ## Advanced Configuration
 

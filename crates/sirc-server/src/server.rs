@@ -43,8 +43,10 @@ impl Server {
     }
 
     /// Enable federation and return self for chaining
-    pub fn with_federation(mut self, _fed_port: u16) -> Self {
-        let federation = Arc::new(FederationManager::new(self.name.clone()));
+    pub fn with_federation(mut self, _fed_port: u16, enable_tls: bool) -> Result<Self> {
+        let federation_mgr = FederationManager::new(self.name.clone());
+        let federation_mgr = federation_mgr.with_tls(enable_tls)?;
+        let federation = Arc::new(federation_mgr);
 
         // Update state with federation reference
         let state = Arc::new(ServerState {
@@ -56,7 +58,7 @@ impl Server {
 
         self.state = state;
         self.federation = Some(federation);
-        self
+        Ok(self)
     }
 
     /// Start federation listener
@@ -70,6 +72,10 @@ impl Server {
             // Start keepalive task
             Arc::clone(federation).start_keepalive_task();
             info!("Keepalive task started (30s interval)");
+
+            // Start auto-reconnect task
+            Arc::clone(federation).start_reconnect_task();
+            info!("Auto-reconnect task started (5s check interval)");
         }
         Ok(())
     }

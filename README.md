@@ -113,13 +113,17 @@ BURST / BURST_END                # State synchronization
 - [x] Mesh network topology
 - [x] Channel state synchronization
 - [x] Automatic routing
+- [x] **Cross-server private messaging** (SMSG protocol)
+- [x] **Server authentication** (TLS certificates)
+- [x] **Encrypted server links** (TLS 1.3)
+- [x] **Persistent key storage** (saved to ~/.sirc/)
+- [x] **Keepalive mechanism** (SPING/SPONG every 30s)
+- [x] **Auto-reconnect for peers** (exponential backoff, max 10 retries)
 
 ### 🚧 In Development
 - [ ] Perfect Forward Secrecy (key rotation)
-- [ ] Cross-server private messaging
-- [ ] Server authentication
-- [ ] Encrypted server links
-- [ ] Persistent key storage
+- [ ] Split brain detection and healing
+- [ ] Performance metrics dashboard
 - [ ] Mobile/web clients
 
 ## Development Status
@@ -132,12 +136,15 @@ BURST / BURST_END                # State synchronization
 - 3+ server federation mesh network ✅
 - Channel synchronization across servers ✅
 - TUI client with real-time messaging ✅
+- Cross-server private messaging ✅
+- TLS server authentication and encryption ✅
+- Auto-reconnect with exponential backoff ✅
 
 ### What's Next
-- User-to-user cross-server messaging
-- Server authentication and TLS
+- Split brain detection and healing
+- Performance metrics and monitoring
 - Advanced routing algorithms
-- Performance optimization
+- Perfect Forward Secrecy
 
 ## Testing
 

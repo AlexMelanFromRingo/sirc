@@ -23,6 +23,12 @@ futures = "0.3"
 # Networking
 bytes = "1.7"
 
+# TLS/Security
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.1"
+rcgen = "0.13"
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

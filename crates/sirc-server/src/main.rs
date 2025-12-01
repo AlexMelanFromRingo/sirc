@@ -4,6 +4,7 @@ mod server;
 mod client;
 mod channel;
 mod federation;
+mod tls;
 
 use anyhow::Result;
 use clap::Parser;
@@ -33,6 +34,10 @@ struct Args {
     #[arg(long)]
     federate: bool,
 
+    /// Enable TLS for federation (requires --federate)
+    #[arg(long)]
+    tls: bool,
+
     /// Peer servers to connect to (format: host:port)
     #[arg(long)]
     peers: Vec<String>,
@@ -57,9 +62,12 @@ async fn main() -> Result<()> {
     if args.federate {
         info!("Federation mode enabled");
         info!("Federation port: {}", args.fed_port);
+        if args.tls {
+            info!("TLS enabled for federation");
+        }
 
         // Enable federation
-        server = server.with_federation(args.fed_port);
+        server = server.with_federation(args.fed_port, args.tls)?;
 
         // Start federation listener
         server.start_federation(args.fed_port).await?;
