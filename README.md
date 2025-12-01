@@ -121,9 +121,11 @@ BURST / BURST_END                # State synchronization
 - [x] **Auto-reconnect for peers** (exponential backoff, max 10 retries)
 - [x] **Split brain detection and healing** (120s timeout, automatic resync)
 - [x] **Performance metrics dashboard** (messages, connections, latency, partitions)
+- [x] **Message delivery confirmations** (ACK protocol with automatic retry)
 
 ### 🚧 In Development
 - [ ] Perfect Forward Secrecy (key rotation)
+- [ ] Certificate revocation (CRL/OCSP)
 - [ ] Mobile/web clients
 
 ## Development Status
@@ -141,9 +143,11 @@ BURST / BURST_END                # State synchronization
 - Auto-reconnect with exponential backoff ✅
 - Split brain detection and automatic healing ✅
 - Comprehensive performance metrics ✅
+- Message delivery confirmations with ACK ✅
 
 ### What's Next
 - Perfect Forward Secrecy (key rotation)
+- Certificate revocation (CRL/OCSP)
 - Advanced routing algorithms
 - Mobile/web clients
 

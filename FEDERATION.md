@@ -213,10 +213,10 @@ Server A knows:
 - [x] **Encrypted server-to-server links (TLS 1.3)**
 - [x] **Split brain detection and healing** (120s timeout, automatic resync)
 - [x] **Performance metrics** (messages, connections, latency, partitions)
+- [x] **Message delivery confirmations** (ACK protocol, 5s timeout, auto-retry)
 
 ### 🚧 In Development
 
-- [ ] Message delivery confirmations
 - [ ] Certificate revocation (CRL/OCSP)
 - [ ] Advanced routing optimization
 
