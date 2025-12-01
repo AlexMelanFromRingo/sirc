@@ -1,0 +1,16 @@
+[package]
+name = "sirc-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+sirc-crypto = { path = "../sirc-crypto" }
+
+[dev-dependencies]
+tokio = { workspace = true }

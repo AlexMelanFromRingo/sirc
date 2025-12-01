@@ -1,0 +1,21 @@
+[package]
+name = "sirc-crypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+data-encoding = "2.6"
+hex = "0.4"
+
+[dev-dependencies]
+criterion = { workspace = true }
