@@ -8,7 +8,7 @@ use sirc_protocol::{Command, IrcCodec, Message, Prefix};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
@@ -17,15 +17,17 @@ pub struct Client {
     pub username: RwLock<Option<String>>,
     pub realname: RwLock<Option<String>>,
     pub session: RwLock<EncryptedSession>,
+    pub tx: mpsc::UnboundedSender<Message>,
 }
 
 impl Client {
-    pub fn new() -> Arc<Self> {
+    pub fn new(tx: mpsc::UnboundedSender<Message>) -> Arc<Self> {
         Arc::new(Self {
             nick: RwLock::new(None),
             username: RwLock::new(None),
             realname: RwLock::new(None),
             session: RwLock::new(EncryptedSession::new()),
+            tx,
         })
     }
 }
@@ -34,7 +36,6 @@ pub struct ClientHandler {
     socket: TcpStream,
     addr: SocketAddr,
     state: Arc<ServerState>,
-    client: Arc<Client>,
 }
 
 impl ClientHandler {
@@ -43,7 +44,6 @@ impl ClientHandler {
             socket,
             addr,
             state,
-            client: Client::new(),
         }
     }
 
@@ -52,29 +52,49 @@ impl ClientHandler {
             socket,
             addr,
             state,
-            client,
         } = self;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_with_channel = Client::new(tx);
 
         let mut framed = Framed::new(socket, IrcCodec::new());
 
         // Send welcome
         Self::send_welcome_msg(&mut framed, &state.name).await?;
 
-        while let Some(result) = framed.next().await {
-            match result {
-                Ok(message) => {
-                    debug!("Received: {:?}", message);
-                    if let Err(e) =
-                        Self::handle_message(&mut framed, message, &client, &state).await
-                    {
-                        warn!("Error handling message: {}", e);
+        loop {
+            tokio::select! {
+                // Handle incoming messages from client
+                result = framed.next() => {
+                    match result {
+                        Some(Ok(message)) => {
+                            debug!("Received: {:?}", message);
+                            if let Err(e) =
+                                Self::handle_message(&mut framed, message, &client_with_channel, &state).await
+                            {
+                                warn!("Error handling message: {}", e);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            warn!("Error decoding message: {}", e);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                Err(e) => {
-                    warn!("Error decoding message: {}", e);
-                    break;
+                // Handle outgoing messages to client
+                Some(msg) = rx.recv() => {
+                    if let Err(e) = framed.send(msg).await {
+                        warn!("Error sending message: {}", e);
+                        break;
+                    }
                 }
             }
+        }
+
+        // Cleanup: remove client from state
+        if let Some(nick) = client_with_channel.nick.read().await.clone() {
+            state.clients.write().await.remove(&nick);
         }
 
         info!("Client {} disconnected", addr);
@@ -146,6 +166,9 @@ impl ClientHandler {
         state: &Arc<ServerState>,
     ) -> Result<()> {
         *client.nick.write().await = Some(nick.clone());
+
+        // Add client to state
+        state.clients.write().await.insert(nick.clone(), Arc::clone(client));
 
         let response = Message::with_prefix(
             Prefix::Server(state.name.clone()),
@@ -267,15 +290,70 @@ impl ClientHandler {
 
         info!("PRIVMSG from {} to {}: {}", nick, target, text);
 
-        // Echo back for now (TODO: route to actual target)
-        let response = Message::with_prefix(
-            Prefix::Server(state.name.clone()),
-            Command::Notice {
-                target: nick,
-                text: format!("Message to {} delivered (echo)", target),
+        // Build the message to broadcast
+        let msg = Message::with_prefix(
+            Prefix::User {
+                nick: nick.clone(),
+                user: client.username.read().await.clone(),
+                host: Some("localhost".to_string()),
+            },
+            Command::PrivMsg {
+                target: target.clone(),
+                text: text.clone(),
             },
         );
-        framed.send(response).await?;
+
+        // Check if target is a channel
+        if target.starts_with('#') {
+            // Send to all members of the channel
+            let channels = state.channels.read().await;
+            if let Some(channel) = channels.get(&target) {
+                let members = channel.members.clone();
+                drop(channels);
+
+                let clients = state.clients.read().await;
+                for member_nick in members {
+                    // Don't send to the sender
+                    if member_nick == nick {
+                        continue;
+                    }
+
+                    if let Some(member_client) = clients.get(&member_nick) {
+                        if let Err(e) = member_client.tx.send(msg.clone()) {
+                            warn!("Failed to send to {}: {}", member_nick, e);
+                        }
+                    }
+                }
+            } else {
+                // Channel doesn't exist
+                let error = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 403, // ERR_NOSUCHCHANNEL
+                        params: vec![nick, target, "No such channel".to_string()],
+                    },
+                );
+                framed.send(error).await?;
+            }
+        } else {
+            // Send to specific user
+            let clients = state.clients.read().await;
+            if let Some(target_client) = clients.get(&target) {
+                if let Err(e) = target_client.tx.send(msg) {
+                    warn!("Failed to send to {}: {}", target, e);
+                }
+            } else {
+                // User not found
+                let error = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 401, // ERR_NOSUCHNICK
+                        params: vec![nick, target, "No such nick".to_string()],
+                    },
+                );
+                framed.send(error).await?;
+            }
+        }
 
         Ok(())
     }
