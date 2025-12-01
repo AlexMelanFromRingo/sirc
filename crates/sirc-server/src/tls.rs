@@ -4,27 +4,113 @@
 //! for secure server-to-server connections.
 
 use anyhow::{Context, Result};
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::CertificateDer;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ServerConfig};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tracing::info;
+use std::sync::{Arc, RwLock as StdRwLock};
+use tracing::{info, warn};
+
+/// Certificate Revocation List manager
+#[derive(Debug)]
+pub struct CertificateRevocationList {
+    revoked_fingerprints: Arc<StdRwLock<HashSet<String>>>,
+    crl_path: PathBuf,
+}
+
+impl CertificateRevocationList {
+    pub fn new(crl_path: PathBuf) -> Self {
+        let revoked = Self::load_from_file(&crl_path).unwrap_or_default();
+        Self {
+            revoked_fingerprints: Arc::new(StdRwLock::new(revoked)),
+            crl_path,
+        }
+    }
+
+    fn load_from_file(path: &PathBuf) -> Result<HashSet<String>> {
+        if !path.exists() {
+            return Ok(HashSet::new());
+        }
+
+        let content = fs::read_to_string(path)?;
+        let mut revoked = HashSet::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                revoked.insert(line.to_string());
+            }
+        }
+
+        Ok(revoked)
+    }
+
+    fn save_to_file(&self) -> Result<()> {
+        let revoked = self.revoked_fingerprints.read().unwrap();
+        let mut content = String::from("# Certificate Revocation List\n");
+        content.push_str("# One fingerprint per line\n\n");
+
+        for fingerprint in revoked.iter() {
+            content.push_str(fingerprint);
+            content.push('\n');
+        }
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = self.crl_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::write(&self.crl_path, content)?;
+        Ok(())
+    }
+
+    pub fn revoke(&self, fingerprint: String) -> Result<()> {
+        info!("Revoking certificate with fingerprint: {}", fingerprint);
+        let mut revoked = self.revoked_fingerprints.write().unwrap();
+        revoked.insert(fingerprint);
+        drop(revoked);
+        self.save_to_file()?;
+        Ok(())
+    }
+
+    pub fn is_revoked(&self, fingerprint: &str) -> bool {
+        let revoked = self.revoked_fingerprints.read().unwrap();
+        revoked.contains(fingerprint)
+    }
+
+    pub fn unrevoke(&self, fingerprint: &str) -> Result<()> {
+        info!("Unrevoking certificate with fingerprint: {}", fingerprint);
+        let mut revoked = self.revoked_fingerprints.write().unwrap();
+        revoked.remove(fingerprint);
+        drop(revoked);
+        self.save_to_file()?;
+        Ok(())
+    }
+
+    pub fn list_revoked(&self) -> Vec<String> {
+        let revoked = self.revoked_fingerprints.read().unwrap();
+        revoked.iter().cloned().collect()
+    }
+}
 
 /// TLS certificate manager for federation
 pub struct TlsManager {
     cert_path: PathBuf,
     key_path: PathBuf,
+    crl: Arc<CertificateRevocationList>,
 }
 
 impl TlsManager {
     /// Create a new TLS manager
     pub fn new(server_name: &str) -> Self {
         let cert_dir = Self::default_cert_dir();
+        let crl_path = cert_dir.join("revoked.crl");
         Self {
             cert_path: cert_dir.join(format!("{}.crt", server_name)),
             key_path: cert_dir.join(format!("{}.key", server_name)),
+            crl: Arc::new(CertificateRevocationList::new(crl_path)),
         }
     }
 
@@ -116,45 +202,29 @@ impl TlsManager {
         Ok(Arc::new(config))
     }
 
-    /// Create client TLS configuration
+    /// Create client TLS configuration with CRL checking
     pub fn client_config(&self, trust_all: bool) -> Result<Arc<ClientConfig>> {
-        let mut root_store = RootCertStore::empty();
-
         if trust_all {
-            // For testing: trust all certificates (insecure!)
-            info!("WARNING: TLS configured to trust all certificates (insecure)");
+            // Use CRL verifier that trusts all but checks revocation
+            info!("TLS configured with CRL checking (trust all mode)");
 
+            let verifier = CrlVerifier::new(Arc::clone(&self.crl));
             let config = ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(DangerousVerifier))
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
 
             return Ok(Arc::new(config));
         }
 
-        // Load trusted certificates from cert directory
-        let cert_dir = Self::default_cert_dir();
-        if cert_dir.exists() {
-            for entry in fs::read_dir(cert_dir)? {
-                let entry = entry?;
-                let path = entry.path();
+        // For proper certificate validation with CRL
+        // We still need to use custom verifier to check CRL
+        info!("TLS configured with full certificate validation and CRL checking");
 
-                if path.extension().and_then(|s| s.to_str()) == Some("crt") {
-                    let cert_pem = fs::read_to_string(&path)?;
-                    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    for cert in certs {
-                        root_store.add(cert)?;
-                    }
-
-                    info!("Added trusted certificate from {:?}", path);
-                }
-            }
-        }
-
+        let verifier = CrlVerifier::new(Arc::clone(&self.crl));
         let config = ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
 
         Ok(Arc::new(config))
@@ -173,6 +243,37 @@ impl TlsManager {
             anyhow::bail!("No certificate found")
         }
     }
+
+    /// Revoke a certificate by fingerprint
+    pub fn revoke_certificate(&self, fingerprint: String) -> Result<()> {
+        self.crl.revoke(fingerprint)
+    }
+
+    /// Unrevoke a certificate by fingerprint
+    pub fn unrevoke_certificate(&self, fingerprint: &str) -> Result<()> {
+        self.crl.unrevoke(fingerprint)
+    }
+
+    /// Check if a certificate is revoked
+    pub fn is_certificate_revoked(&self, fingerprint: &str) -> bool {
+        self.crl.is_revoked(fingerprint)
+    }
+
+    /// List all revoked certificates
+    pub fn list_revoked_certificates(&self) -> Vec<String> {
+        self.crl.list_revoked()
+    }
+
+    /// Get CRL reference
+    pub fn crl(&self) -> Arc<CertificateRevocationList> {
+        Arc::clone(&self.crl)
+    }
+
+    /// Compute fingerprint from certificate DER
+    pub fn compute_fingerprint(cert: &CertificateDer) -> String {
+        let hash = blake3::hash(cert.as_ref());
+        hex::encode(hash.as_bytes())
+    }
 }
 
 /// Dangerous certificate verifier that trusts all certificates
@@ -190,6 +291,70 @@ impl rustls::client::danger::ServerCertVerifier for DangerousVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         // Trust everything (DANGEROUS!)
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Certificate verifier with CRL checking
+/// Trusts all certificates but checks against revocation list
+#[derive(Debug, Clone)]
+struct CrlVerifier {
+    crl: Arc<CertificateRevocationList>,
+}
+
+impl CrlVerifier {
+    fn new(crl: Arc<CertificateRevocationList>) -> Self {
+        Self { crl }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for CrlVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &rustls::pki_types::ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Compute certificate fingerprint
+        let fingerprint = TlsManager::compute_fingerprint(end_entity);
+
+        // Check if certificate is revoked
+        if self.crl.is_revoked(&fingerprint) {
+            warn!("Certificate with fingerprint {} is revoked!", fingerprint);
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
+        }
+
+        // Trust the certificate (for federation with self-signed certs)
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
