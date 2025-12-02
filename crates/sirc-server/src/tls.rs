@@ -393,9 +393,11 @@ mod tests {
     #[test]
     fn test_generate_certificate() {
         let dir = tempdir().unwrap();
+        let crl_path = dir.path().join("revoked.crl");
         let tls = TlsManager {
             cert_path: dir.path().join("test.crt"),
             key_path: dir.path().join("test.key"),
+            crl: Arc::new(CertificateRevocationList::new(crl_path)),
         };
 
         tls.generate_self_signed("test.sirc").unwrap();
@@ -407,9 +409,11 @@ mod tests {
     #[test]
     fn test_load_or_generate() {
         let dir = tempdir().unwrap();
+        let crl_path = dir.path().join("revoked.crl");
         let tls = TlsManager {
             cert_path: dir.path().join("test2.crt"),
             key_path: dir.path().join("test2.key"),
+            crl: Arc::new(CertificateRevocationList::new(crl_path)),
         };
 
         // First call generates
@@ -425,10 +429,15 @@ mod tests {
 
     #[test]
     fn test_server_config() {
+        // Install default crypto provider for rustls
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
         let dir = tempdir().unwrap();
+        let crl_path = dir.path().join("revoked.crl");
         let tls = TlsManager {
             cert_path: dir.path().join("test3.crt"),
             key_path: dir.path().join("test3.key"),
+            crl: Arc::new(CertificateRevocationList::new(crl_path)),
         };
 
         tls.generate_self_signed("test3.sirc").unwrap();

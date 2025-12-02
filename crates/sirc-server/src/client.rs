@@ -181,11 +181,13 @@ impl ClientHandler {
                 }
                 // Handle outgoing messages to client
                 Some(msg) = rx.recv() => {
-                    debug!("Received message from channel for delivery: {:?}", msg);
+                    let nick = client_with_channel.nick.read().await.clone().unwrap_or_else(|| "<unknown>".to_string());
+                    info!("→ [{}] Received message from mpsc channel, delivering to client: {:?}", nick, msg);
                     if let Err(e) = framed.send(msg).await {
-                        warn!("Error sending message: {}", e);
+                        warn!("✗ [{}] Error sending message to client: {}", nick, e);
                         break;
                     }
+                    info!("✓ [{}] Message successfully sent to client", nick);
                 }
                 // Check for message timeouts and retry
                 _ = timeout_interval.tick() => {
@@ -369,6 +371,8 @@ impl ClientHandler {
         let nick = client.nick.read().await.clone().unwrap_or_default();
 
         for channel_name in channels {
+            info!("Client '{}' joining channel '{}'", nick, channel_name);
+
             // Create channel if it doesn't exist
             let mut channels = state.channels.write().await;
             let channel = channels
@@ -377,6 +381,9 @@ impl ClientHandler {
 
             // Add user to channel
             channel.add_member(nick.clone());
+
+            info!("Channel '{}' now has {} members: {:?}",
+                  channel_name, channel.members.len(), channel.members);
             drop(channels);
 
             // Notify federation if enabled
@@ -449,14 +456,21 @@ impl ClientHandler {
 
         // Check if target is a channel
         if target.starts_with('#') {
+            info!("Sending message to channel '{}'", target);
+
             // Send to all members of the channel
             let channels = state.channels.read().await;
             if let Some(channel) = channels.get(&target) {
                 let members = channel.members.clone();
                 let has_recipients = !members.is_empty();
+
+                info!("Channel '{}' has {} members: {:?}", target, members.len(), members);
                 drop(channels);
 
                 let clients = state.clients.read().await;
+                info!("Total clients registered in server: {}", clients.len());
+                info!("Registered client nicks: {:?}", clients.keys().collect::<Vec<_>>());
+
                 for member_nick in members {
                     // Don't send to the sender
                     if member_nick == nick {
@@ -465,17 +479,23 @@ impl ClientHandler {
 
                     info!("Looking for client '{}' in registry", member_nick);
                     if let Some(member_client) = clients.get(&member_nick) {
-                        info!("Found client '{}', sending MSGID and message", member_nick);
+                        info!("Found client '{}' in registry, sending MSGID and message", member_nick);
+
                         // Send MSGID first
-                        if let Err(e) = member_client.tx.send(msgid_cmd.clone()) {
-                            warn!("Failed to send MSGID to {}: {}", member_nick, e);
-                            continue;
+                        info!("Attempting to send MSGID {} to {}", msgid_cmd.to_string(), member_nick);
+                        match member_client.tx.send(msgid_cmd.clone()) {
+                            Ok(_) => info!("MSGID sent successfully to {}", member_nick),
+                            Err(e) => {
+                                warn!("Failed to send MSGID to {}: {}", member_nick, e);
+                                continue;
+                            }
                         }
+
                         // Then send the actual message
-                        if let Err(e) = member_client.tx.send(msg.clone()) {
-                            warn!("Failed to send to {}: {}", member_nick, e);
-                        } else {
-                            info!("Successfully sent message to {}", member_nick);
+                        info!("Attempting to send message to {}: {:?}", member_nick, msg);
+                        match member_client.tx.send(msg.clone()) {
+                            Ok(_) => info!("✓ Message successfully queued for delivery to {}", member_nick),
+                            Err(e) => warn!("✗ Failed to send to {}: {}", member_nick, e),
                         }
                     } else {
                         warn!("Client '{}' not found in registry!", member_nick);
