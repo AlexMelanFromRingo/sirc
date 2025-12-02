@@ -181,6 +181,7 @@ impl ClientHandler {
                 }
                 // Handle outgoing messages to client
                 Some(msg) = rx.recv() => {
+                    debug!("Received message from channel for delivery: {:?}", msg);
                     if let Err(e) = framed.send(msg).await {
                         warn!("Error sending message: {}", e);
                         break;
@@ -302,6 +303,7 @@ impl ClientHandler {
 
         // Add client to state
         state.clients.write().await.insert(nick.clone(), Arc::clone(client));
+        info!("Registered client '{}' in state.clients", nick);
 
         let response = Message::with_prefix(
             Prefix::Server(state.name.clone()),
@@ -461,7 +463,9 @@ impl ClientHandler {
                         continue;
                     }
 
+                    info!("Looking for client '{}' in registry", member_nick);
                     if let Some(member_client) = clients.get(&member_nick) {
+                        info!("Found client '{}', sending MSGID and message", member_nick);
                         // Send MSGID first
                         if let Err(e) = member_client.tx.send(msgid_cmd.clone()) {
                             warn!("Failed to send MSGID to {}: {}", member_nick, e);
@@ -470,7 +474,11 @@ impl ClientHandler {
                         // Then send the actual message
                         if let Err(e) = member_client.tx.send(msg.clone()) {
                             warn!("Failed to send to {}: {}", member_nick, e);
+                        } else {
+                            info!("Successfully sent message to {}", member_nick);
                         }
+                    } else {
+                        warn!("Client '{}' not found in registry!", member_nick);
                     }
                 }
 
