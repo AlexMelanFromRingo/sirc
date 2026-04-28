@@ -259,6 +259,18 @@ impl ClientHandler {
             Command::Join(channels) => {
                 Self::handle_join(framed, channels, client, state).await?;
             }
+            Command::Part { channels, message } => {
+                Self::handle_part(framed, channels, message, client, state).await?;
+            }
+            Command::Topic { channel, topic } => {
+                Self::handle_topic(framed, channel, topic, client, state).await?;
+            }
+            Command::Kick { channel, user, comment } => {
+                Self::handle_kick(framed, channel, user, comment, client, state).await?;
+            }
+            Command::Names(channels) => {
+                Self::handle_names(framed, channels, client, state).await?;
+            }
             Command::PrivMsg { target, text } => {
                 Self::handle_privmsg(framed, target, text, client, state).await?;
             }
@@ -277,6 +289,9 @@ impl ClientHandler {
             }
             Command::Ack { message_id } => {
                 Self::handle_ack(message_id, client).await?;
+            }
+            Command::Raw { command, params: _ } if command == "STATS" => {
+                Self::handle_stats(framed, client, state).await?;
             }
             Command::Raw { command, params } if command == "MSGID" => {
                 // Automatically send ACK for received message ID
@@ -421,6 +436,347 @@ impl ClientHandler {
         Ok(())
     }
 
+    async fn handle_part(
+        framed: &mut Framed<TcpStream, IrcCodec>,
+        channels: Vec<String>,
+        message: Option<String>,
+        client: &Arc<Client>,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let nick = client.nick.read().await.clone().unwrap_or_default();
+        let prefix = Prefix::User {
+            nick: nick.clone(),
+            user: client.username.read().await.clone(),
+            host: Some("localhost".to_string()),
+        };
+
+        for channel_name in channels {
+            let mut chans = state.channels.write().await;
+            let channel = match chans.get_mut(&channel_name) {
+                Some(c) => c,
+                None => {
+                    drop(chans);
+                    let err = Message::with_prefix(
+                        Prefix::Server(state.name.clone()),
+                        Command::Numeric {
+                            code: 403, // ERR_NOSUCHCHANNEL
+                            params: vec![nick.clone(), channel_name.clone(), "No such channel".to_string()],
+                        },
+                    );
+                    framed.send(err).await?;
+                    continue;
+                }
+            };
+            if !channel.has_member(&nick) {
+                drop(chans);
+                let err = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 442, // ERR_NOTONCHANNEL
+                        params: vec![nick.clone(), channel_name.clone(), "You're not on that channel".to_string()],
+                    },
+                );
+                framed.send(err).await?;
+                continue;
+            }
+            channel.remove_member(&nick);
+            let members: Vec<String> = channel.members.iter().cloned().collect();
+            let channel_empty = members.is_empty();
+            if channel_empty {
+                chans.remove(&channel_name);
+            }
+            drop(chans);
+
+            // Echo PART to every remaining member, including the parting user.
+            let part_msg = Message::with_prefix(
+                prefix.clone(),
+                Command::Part {
+                    channels: vec![channel_name.clone()],
+                    message: message.clone(),
+                },
+            );
+            framed.send(part_msg.clone()).await?;
+            let clients = state.clients.read().await;
+            for member_nick in &members {
+                if let Some(c) = clients.get(member_nick) {
+                    let _ = c.tx.send(part_msg.clone());
+                }
+            }
+
+            info!("Client '{}' parted channel '{}'", nick, channel_name);
+        }
+        Ok(())
+    }
+
+    async fn handle_topic(
+        framed: &mut Framed<TcpStream, IrcCodec>,
+        channel: String,
+        topic: Option<String>,
+        client: &Arc<Client>,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let nick = client.nick.read().await.clone().unwrap_or_default();
+        let mut chans = state.channels.write().await;
+        let chan = match chans.get_mut(&channel) {
+            Some(c) => c,
+            None => {
+                drop(chans);
+                let err = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 403,
+                        params: vec![nick, channel, "No such channel".to_string()],
+                    },
+                );
+                framed.send(err).await?;
+                return Ok(());
+            }
+        };
+        if !chan.has_member(&nick) {
+            drop(chans);
+            let err = Message::with_prefix(
+                Prefix::Server(state.name.clone()),
+                Command::Numeric {
+                    code: 442,
+                    params: vec![nick, channel, "You're not on that channel".to_string()],
+                },
+            );
+            framed.send(err).await?;
+            return Ok(());
+        }
+
+        match topic {
+            // Read-back: return current topic.
+            None => {
+                let resp = match &chan.topic {
+                    Some(t) => Message::with_prefix(
+                        Prefix::Server(state.name.clone()),
+                        Command::Numeric {
+                            code: 332, // RPL_TOPIC
+                            params: vec![nick.clone(), channel.clone(), t.clone()],
+                        },
+                    ),
+                    None => Message::with_prefix(
+                        Prefix::Server(state.name.clone()),
+                        Command::Numeric {
+                            code: 331, // RPL_NOTOPIC
+                            params: vec![nick.clone(), channel.clone(), "No topic is set".to_string()],
+                        },
+                    ),
+                };
+                drop(chans);
+                framed.send(resp).await?;
+            }
+            Some(new_topic) => {
+                let new = if new_topic.is_empty() { None } else { Some(new_topic) };
+                chan.set_topic(new.clone());
+                let members: Vec<String> = chan.members.iter().cloned().collect();
+                drop(chans);
+
+                let topic_msg = Message::with_prefix(
+                    Prefix::User {
+                        nick: nick.clone(),
+                        user: client.username.read().await.clone(),
+                        host: Some("localhost".to_string()),
+                    },
+                    Command::Topic { channel: channel.clone(), topic: new },
+                );
+                framed.send(topic_msg.clone()).await?;
+                let clients = state.clients.read().await;
+                for m in &members {
+                    if m == &nick { continue; }
+                    if let Some(c) = clients.get(m) {
+                        let _ = c.tx.send(topic_msg.clone());
+                    }
+                }
+                info!("Client '{}' set topic for '{}'", nick, channel);
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_kick(
+        framed: &mut Framed<TcpStream, IrcCodec>,
+        channel: String,
+        user: String,
+        comment: Option<String>,
+        client: &Arc<Client>,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let nick = client.nick.read().await.clone().unwrap_or_default();
+        let mut chans = state.channels.write().await;
+        let chan = match chans.get_mut(&channel) {
+            Some(c) => c,
+            None => {
+                drop(chans);
+                let err = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 403,
+                        params: vec![nick, channel, "No such channel".to_string()],
+                    },
+                );
+                framed.send(err).await?;
+                return Ok(());
+            }
+        };
+        if !chan.has_member(&nick) {
+            drop(chans);
+            let err = Message::with_prefix(
+                Prefix::Server(state.name.clone()),
+                Command::Numeric {
+                    code: 442,
+                    params: vec![nick, channel, "You're not on that channel".to_string()],
+                },
+            );
+            framed.send(err).await?;
+            return Ok(());
+        }
+        if !chan.has_member(&user) {
+            drop(chans);
+            let err = Message::with_prefix(
+                Prefix::Server(state.name.clone()),
+                Command::Numeric {
+                    code: 441, // ERR_USERNOTINCHANNEL
+                    params: vec![nick, user, channel, "They aren't on that channel".to_string()],
+                },
+            );
+            framed.send(err).await?;
+            return Ok(());
+        }
+        chan.remove_member(&user);
+        let members: Vec<String> = chan.members.iter().cloned().collect();
+        let channel_empty = members.is_empty();
+        if channel_empty {
+            chans.remove(&channel);
+        }
+        drop(chans);
+
+        let kick_msg = Message::with_prefix(
+            Prefix::User {
+                nick: nick.clone(),
+                user: client.username.read().await.clone(),
+                host: Some("localhost".to_string()),
+            },
+            Command::Kick { channel: channel.clone(), user: user.clone(), comment: comment.clone() },
+        );
+        framed.send(kick_msg.clone()).await?;
+        let clients = state.clients.read().await;
+        for m in &members {
+            if let Some(c) = clients.get(m) {
+                let _ = c.tx.send(kick_msg.clone());
+            }
+        }
+        // Inform the kicked user too.
+        if let Some(c) = clients.get(&user) {
+            let _ = c.tx.send(kick_msg.clone());
+        }
+        info!("Client '{}' kicked '{}' from '{}'", nick, user, channel);
+        Ok(())
+    }
+
+    async fn handle_names(
+        framed: &mut Framed<TcpStream, IrcCodec>,
+        channels: Vec<String>,
+        client: &Arc<Client>,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let nick = client.nick.read().await.clone().unwrap_or_default();
+        let chans = state.channels.read().await;
+
+        // If no channels specified, list all known channels.
+        let names_to_query: Vec<String> = if channels.is_empty() {
+            chans.keys().cloned().collect()
+        } else {
+            channels
+        };
+
+        for channel_name in names_to_query {
+            if let Some(chan) = chans.get(&channel_name) {
+                let members: Vec<String> = chan.members.iter().cloned().collect();
+                let names_line = members.join(" ");
+                let reply = Message::with_prefix(
+                    Prefix::Server(state.name.clone()),
+                    Command::Numeric {
+                        code: 353, // RPL_NAMREPLY
+                        params: vec![nick.clone(), "=".to_string(), channel_name.clone(), names_line],
+                    },
+                );
+                framed.send(reply).await?;
+            }
+            let end = Message::with_prefix(
+                Prefix::Server(state.name.clone()),
+                Command::Numeric {
+                    code: 366, // RPL_ENDOFNAMES
+                    params: vec![nick.clone(), channel_name, "End of /NAMES list".to_string()],
+                },
+            );
+            framed.send(end).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_stats(
+        framed: &mut Framed<TcpStream, IrcCodec>,
+        client: &Arc<Client>,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let nick = client.nick.read().await.clone().unwrap_or_default();
+        let server_name = state.name.clone();
+
+        // Collect all lines first, then send — sidesteps borrow-checker issues
+        // with mixing &mut framed and async state reads in the same expression.
+        let mut lines: Vec<String> = Vec::new();
+
+        let local_clients = state.clients.read().await.len();
+        let local_channels = state.channels.read().await.len();
+        lines.push(format!(
+            "server {} clients={} channels={}",
+            server_name, local_clients, local_channels
+        ));
+
+        let pending = client.delivery_tracker.pending_count().await;
+        lines.push(format!("self pending_acks={}", pending));
+
+        if let Some(ref federation) = state.federation {
+            let (direct, all) = federation.route_summary().await;
+            lines.push(format!(
+                "federation direct={} known_servers={}",
+                direct.len(),
+                all.len()
+            ));
+            for peer in &direct {
+                if let Some((addr, hop, info)) = federation.peer_info(peer).await {
+                    lines.push(format!(
+                        "peer {} addr={} hop={} info={:?}",
+                        peer, addr, hop, info
+                    ));
+                }
+            }
+        }
+
+        // 211 RPL_STATSLINKINFO + 219 RPL_ENDOFSTATS — IRC convention.
+        for line in lines {
+            let msg = Message::with_prefix(
+                Prefix::Server(server_name.clone()),
+                Command::Numeric {
+                    code: 211,
+                    params: vec![nick.clone(), "L".to_string(), line],
+                },
+            );
+            framed.send(msg).await?;
+        }
+        let end = Message::with_prefix(
+            Prefix::Server(server_name),
+            Command::Numeric {
+                code: 219,
+                params: vec![nick, "L".to_string(), "End of /STATS report".to_string()],
+            },
+        );
+        framed.send(end).await?;
+        Ok(())
+    }
+
     async fn handle_privmsg(
         framed: &mut Framed<TcpStream, IrcCodec>,
         target: String,
@@ -461,6 +817,19 @@ impl ClientHandler {
             // Send to all members of the channel
             let channels = state.channels.read().await;
             if let Some(channel) = channels.get(&target) {
+                // Sender must be a member (no external messages).
+                if !channel.has_member(&nick) {
+                    drop(channels);
+                    let err = Message::with_prefix(
+                        Prefix::Server(state.name.clone()),
+                        Command::Numeric {
+                            code: 404, // ERR_CANNOTSENDTOCHAN
+                            params: vec![nick.clone(), target.clone(), "Cannot send to channel (not a member)".to_string()],
+                        },
+                    );
+                    framed.send(err).await?;
+                    return Ok(());
+                }
                 let members = channel.members.clone();
                 let has_recipients = !members.is_empty();
 
@@ -542,15 +911,28 @@ impl ClientHandler {
                     }
                 }
             } else {
-                // User not found
-                let error = Message::with_prefix(
-                    Prefix::Server(state.name.clone()),
-                    Command::Numeric {
-                        code: 401, // ERR_NOSUCHNICK
-                        params: vec![nick, target, "No such nick".to_string()],
-                    },
-                );
-                framed.send(error).await?;
+                // Local user not found — try federation routing.
+                let mut routed = false;
+                if let Some(ref federation) = state.federation {
+                    match federation.send_message(&nick, &target, text.clone()).await {
+                        Ok(true) => {
+                            info!("PRIVMSG {}→{} routed via federation", nick, target);
+                            routed = true;
+                        }
+                        Ok(false) => { /* not on any known server */ }
+                        Err(e) => warn!("Federation routing failed for {}: {}", target, e),
+                    }
+                }
+                if !routed {
+                    let error = Message::with_prefix(
+                        Prefix::Server(state.name.clone()),
+                        Command::Numeric {
+                            code: 401, // ERR_NOSUCHNICK
+                            params: vec![nick, target, "No such nick".to_string()],
+                        },
+                    );
+                    framed.send(error).await?;
+                }
             }
         }
 

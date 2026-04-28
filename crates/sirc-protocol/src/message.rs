@@ -261,6 +261,49 @@ impl Message {
                     },
                 })
             }
+            "TOPIC" => {
+                let channel = params
+                    .next()
+                    .ok_or(ProtocolError::MissingParameter)?
+                    .to_string();
+                let rest = params.collect::<Vec<_>>().join(" ");
+                let topic = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.trim_start_matches(':').to_string())
+                };
+                Ok(Command::Topic { channel, topic })
+            }
+            "KICK" => {
+                let channel = params
+                    .next()
+                    .ok_or(ProtocolError::MissingParameter)?
+                    .to_string();
+                let user = params
+                    .next()
+                    .ok_or(ProtocolError::MissingParameter)?
+                    .to_string();
+                let rest = params.collect::<Vec<_>>().join(" ");
+                let comment = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.trim_start_matches(':').to_string())
+                };
+                Ok(Command::Kick { channel, user, comment })
+            }
+            "NAMES" => {
+                let channels: Vec<String> = match params.next() {
+                    Some(s) => s.split(',').map(String::from).collect(),
+                    None => Vec::new(),
+                };
+                Ok(Command::Names(channels))
+            }
+            "LIST" => {
+                let channels: Option<Vec<String>> = params
+                    .next()
+                    .map(|s| s.split(',').map(String::from).collect());
+                Ok(Command::List(channels))
+            }
             "PRIVMSG" => {
                 let target = params
                     .next()
@@ -409,6 +452,37 @@ impl Message {
                     result.push_str(m);
                 }
             }
+            Command::Topic { channel, topic } => {
+                result.push_str("TOPIC ");
+                result.push_str(channel);
+                if let Some(t) = topic {
+                    result.push_str(" :");
+                    result.push_str(t);
+                }
+            }
+            Command::Kick { channel, user, comment } => {
+                result.push_str(&format!("KICK {} {}", channel, user));
+                if let Some(c) = comment {
+                    result.push_str(" :");
+                    result.push_str(c);
+                }
+            }
+            Command::Names(channels) => {
+                result.push_str("NAMES");
+                if !channels.is_empty() {
+                    result.push(' ');
+                    result.push_str(&channels.join(","));
+                }
+            }
+            Command::List(channels) => {
+                result.push_str("LIST");
+                if let Some(list) = channels {
+                    if !list.is_empty() {
+                        result.push(' ');
+                        result.push_str(&list.join(","));
+                    }
+                }
+            }
             Command::PrivMsg { target, text } => {
                 result.push_str(&format!("PRIVMSG {} :{}", target, text));
             }
@@ -523,5 +597,72 @@ mod tests {
     fn test_encrypted_key_exchange() {
         let msg = Message::parse("EKEY abc123def456").unwrap();
         assert!(matches!(msg.command, Command::EKey(_)));
+    }
+
+    #[test]
+    fn test_parse_part_with_message() {
+        let msg = Message::parse("PART #room :bye").unwrap();
+        match msg.command {
+            Command::Part { channels, message } => {
+                assert_eq!(channels, vec!["#room"]);
+                assert_eq!(message, Some("bye".to_string()));
+            }
+            other => panic!("expected Part, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_topic_set_and_query() {
+        let set = Message::parse("TOPIC #room :hello world").unwrap();
+        match set.command {
+            Command::Topic { channel, topic } => {
+                assert_eq!(channel, "#room");
+                assert_eq!(topic, Some("hello world".to_string()));
+            }
+            other => panic!("expected Topic, got {:?}", other),
+        }
+        let q = Message::parse("TOPIC #room").unwrap();
+        match q.command {
+            Command::Topic { channel, topic } => {
+                assert_eq!(channel, "#room");
+                assert_eq!(topic, None);
+            }
+            other => panic!("expected Topic query, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_kick() {
+        let msg = Message::parse("KICK #room badguy :be nice").unwrap();
+        match msg.command {
+            Command::Kick { channel, user, comment } => {
+                assert_eq!(channel, "#room");
+                assert_eq!(user, "badguy");
+                assert_eq!(comment, Some("be nice".to_string()));
+            }
+            other => panic!("expected Kick, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_names_and_list() {
+        let n = Message::parse("NAMES #a,#b").unwrap();
+        match n.command {
+            Command::Names(channels) => assert_eq!(channels, vec!["#a", "#b"]),
+            other => panic!("expected Names, got {:?}", other),
+        }
+        let l = Message::parse("LIST").unwrap();
+        match l.command {
+            Command::List(c) => assert_eq!(c, None),
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_serialize_topic_kick() {
+        let t = Message::new(Command::Topic { channel: "#r".into(), topic: Some("hi".into()) });
+        assert_eq!(t.to_string(), "TOPIC #r :hi");
+        let k = Message::new(Command::Kick { channel: "#r".into(), user: "u".into(), comment: None });
+        assert_eq!(k.to_string(), "KICK #r u");
     }
 }

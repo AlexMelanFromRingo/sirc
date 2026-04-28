@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::sleep;
-use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
@@ -832,47 +832,60 @@ impl FederationManager {
         Ok(())
     }
 
-    /// Send a message to a user (possibly on remote server)
+    /// Route a private message to a user that may live on a remote server.
+    /// Returns `Ok(true)` if the user was found in the federated state and the
+    /// message was dispatched (locally or via SMSG), `Ok(false)` if no server
+    /// in the routing table claims this nick.
     pub async fn send_message(
         &self,
         origin_nick: &str,
         target_nick: &str,
         text: String,
-    ) -> Result<()> {
-        // Check if target is on a known server
+    ) -> Result<bool> {
         let channels = self.channels.read().await;
-
-        // Search all channels for the target user
         for channel_state in channels.values() {
             if let Some(target_server) = channel_state.users.get(target_nick) {
                 if target_server == &self.local_name {
-                    // Local user - will be handled by server
-                    return Ok(());
-                } else {
-                    // Remote user - route through federation
-                    let fed_msg = FederatedMessage {
-                        origin_server: self.local_name.clone(),
-                        target_server: Some(target_server.clone()),
-                        payload: Message::new(Command::Raw {
-                            command: "SMSG".to_string(),
-                            params: vec![
-                                self.local_name.clone(),
-                                origin_nick.to_string(),
-                                target_nick.to_string(),
-                                format!(":{}", text),
-                            ],
-                        }),
-                    };
-
-                    self.route_to(target_server, fed_msg).await?;
-                    return Ok(());
+                    // Caller's local lookup already failed — the federated
+                    // ChannelState says "local" but client isn't connected.
+                    return Ok(false);
                 }
+                let fed_msg = FederatedMessage {
+                    origin_server: self.local_name.clone(),
+                    target_server: Some(target_server.clone()),
+                    payload: Message::new(Command::Raw {
+                        command: "SMSG".to_string(),
+                        params: vec![
+                            self.local_name.clone(),
+                            origin_nick.to_string(),
+                            target_nick.to_string(),
+                            format!(":{}", text),
+                        ],
+                    }),
+                };
+                self.route_to(target_server, fed_msg).await?;
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
 
-        // User not found in any channel
-        warn!("Target user {} not found in federation", target_nick);
-        Ok(())
+    /// Public read-only access to the routing table for diagnostics
+    /// (`/STATS`, admin tooling). Returns `(direct_peers, all_known_servers)`.
+    pub async fn route_summary(&self) -> (Vec<String>, Vec<String>) {
+        let routing = self.routing.read().await;
+        let direct: Vec<String> = routing.direct_peers.keys().cloned().collect();
+        let all = routing.all_servers();
+        (direct, all)
+    }
+
+    /// Diagnostic info about a peer connection (address, hopcount, info).
+    pub async fn peer_info(&self, name: &str) -> Option<(SocketAddr, u32, String)> {
+        let routing = self.routing.read().await;
+        routing
+            .direct_peers
+            .get(name)
+            .map(|p| (p.address, p.hopcount, p.info.clone()))
     }
 
     /// Send keepalive ping to all peers
