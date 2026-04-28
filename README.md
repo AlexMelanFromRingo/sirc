@@ -126,11 +126,15 @@ BURST / BURST_END                # State synchronization
 
 ### 🚧 In Development
 - [x] Forward secrecy via per-message symmetric KDF ratchet (`RatchetSession`).
-  Old chain keys are zeroized as the chain advances, so a current-key
-  compromise cannot decrypt past traffic. Note: the *future*-secrecy half of
-  Signal's Double Ratchet (DH ratchet) is not yet implemented — closing
-  that gap requires re-keying via a fresh X25519 round each side initiates.
-- [ ] Mobile / web clients (current client is a ratatui TUI)
+- [x] Post-compromise / future secrecy via explicit `rekey()`: mixes a fresh
+  X25519 exchange into the root and bumps a `gen` counter on every message.
+  Peers follow along automatically the next time they decrypt a message at a
+  higher generation. The TUI client triggers `rekey()` every 50 encrypted
+  outbound messages so an attacker who captures the chain only ever gets the
+  next ~50 messages before being locked out again.
+- [ ] Mobile / web clients (current client is a ratatui TUI). Best path is
+  Tauri 2 (Rust backend + small JS frontend) — the same protocol crate
+  compiles to desktop, mobile, and web with shared code.
 
 ## Development Status
 
@@ -183,9 +187,12 @@ This implementation is for learning and experimentation. Do not use for
 sensitive communications without a thorough security audit.
 
 **Known limitations:**
-- Forward secrecy is implemented (symmetric KDF ratchet) but the *future*-
-  secrecy DH ratchet half of Signal's Double Ratchet is not — a stolen
-  current chain key can decrypt new messages until both peers re-key.
+- Forward + post-compromise secrecy are both implemented (symmetric KDF
+  ratchet for FS, explicit X25519 `rekey()` advancing a `gen` counter for
+  PCS). The full Signal Double Ratchet additionally rolls a fresh ephemeral
+  on every round trip; replicating that without an X3DH bootstrap is out
+  of scope for SIRC. In practice the message-count-triggered rekey (every
+  50 messages) gives equivalent protection at coarser granularity.
 - The TUI client trusts any server on first connect (no key pinning yet).
 - No mobile or web client yet — only the ratatui terminal client ships.
 

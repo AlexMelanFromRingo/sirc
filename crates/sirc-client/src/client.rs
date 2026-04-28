@@ -30,7 +30,13 @@ pub struct Client {
     realname: String,
     encrypt: bool,
     session: RatchetSession,
+    /// Encrypted messages sent under the current generation. Used to trigger
+    /// an automatic ratchet `rekey` for post-compromise secrecy.
+    msgs_since_rekey: u64,
 }
+
+/// Trigger an automatic `rekey()` after this many encrypted messages.
+const REKEY_MESSAGE_THRESHOLD: u64 = 50;
 
 impl Client {
     pub fn new(
@@ -47,6 +53,7 @@ impl Client {
             realname,
             encrypt,
             session: RatchetSession::new(),
+            msgs_since_rekey: 0,
         }
     }
 
@@ -196,6 +203,17 @@ impl Client {
                         let text = parts[2..].join(" ");
 
                         if self.encrypt && self.session.is_ready() {
+                            // Periodic re-key for post-compromise secrecy: every
+                            // REKEY_MESSAGE_THRESHOLD encrypted messages, mix in
+                            // a fresh X25519 exchange and reset both chains.
+                            if self.msgs_since_rekey >= REKEY_MESSAGE_THRESHOLD {
+                                if let Err(e) = self.session.rekey() {
+                                    messages.push(format!("*** rekey failed: {}", e));
+                                } else {
+                                    self.msgs_since_rekey = 0;
+                                    messages.push("*** Rotated encryption root key".to_string());
+                                }
+                            }
                             // Send encrypted
                             let encrypted = self.session.encrypt(text.as_bytes())?;
                             let encoded = encrypted.to_base64()?;
@@ -205,6 +223,7 @@ impl Client {
                                     encrypted_data: encoded,
                                 }))
                                 .await?;
+                            self.msgs_since_rekey += 1;
                             messages.push(format!("→ [ENCRYPTED] to {}: {}", target, text));
                         } else {
                             // Send plaintext
