@@ -175,13 +175,34 @@ cargo run --bin sirc-client -- --server localhost:6667 --nick bob --encrypt
 
 ## Security Notice
 
-This implementation is for learning and experimentation. Do not use for sensitive communications without a thorough security audit.
+This implementation is for learning and experimentation. Do not use for
+sensitive communications without a thorough security audit.
 
 **Known limitations:**
-- No Perfect Forward Secrecy yet
-- Server-to-server links not encrypted
-- No server authentication
-- Keys not persisted between sessions
+- No Perfect Forward Secrecy yet (no key rotation between sessions).
+- The TUI client trusts any server on first connect (no key pinning yet).
+
+## Operating
+
+`sirc-server` exposes admin tooling beyond `serve`:
+
+```bash
+# Print this server's certificate fingerprint
+sirc-server fingerprint --name alpha.sirc
+
+# Manage the federation Certificate Revocation List
+sirc-server crl list
+sirc-server crl revoke <fingerprint>
+sirc-server crl unrevoke <fingerprint>
+sirc-server crl is-revoked <fingerprint>
+```
+
+Once connected, IRC clients can send `STATS` to obtain a live snapshot:
+local client / channel counts, pending ACKs, federated peer summary
+(direct + known servers, each peer's address / hopcount), partition
+status, and live metrics (messages sent / received / routed, encrypted,
+active connections, TLS success / fail counts, reconnections, and
+latency avg / min / max).
 
 ## License
 
