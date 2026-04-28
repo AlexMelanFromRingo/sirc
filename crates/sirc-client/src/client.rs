@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Terminal,
 };
-use sirc_crypto::EncryptedSession;
+use sirc_crypto::{RatchetMessage, RatchetSession};
 use sirc_protocol::{Command, IrcCodec, Message};
 use std::io::stdout;
 use tokio::net::TcpStream;
@@ -29,7 +29,7 @@ pub struct Client {
     username: String,
     realname: String,
     encrypt: bool,
-    session: EncryptedSession,
+    session: RatchetSession,
 }
 
 impl Client {
@@ -46,7 +46,7 @@ impl Client {
             username,
             realname,
             encrypt,
-            session: EncryptedSession::new(),
+            session: RatchetSession::new(),
         }
     }
 
@@ -265,8 +265,8 @@ impl Client {
                 encrypted_data,
             } => {
                 if self.session.is_ready() {
-                    let encrypted_msg = sirc_crypto::EncryptedMessage::from_base64(encrypted_data)?;
-                    let plaintext = self.session.decrypt(&encrypted_msg)?;
+                    let ratchet_msg = RatchetMessage::from_base64(encrypted_data)?;
+                    let plaintext = self.session.decrypt(&ratchet_msg)?;
                     let text = String::from_utf8(plaintext)?;
                     messages.push(format!("[ENCRYPTED] {}", text));
                 } else {

@@ -125,8 +125,12 @@ BURST / BURST_END                # State synchronization
 - [x] **Certificate Revocation List (CRL)** (automatic checking during TLS handshake)
 
 ### 🚧 In Development
-- [ ] Perfect Forward Secrecy (key rotation)
-- [ ] Mobile/web clients
+- [x] Forward secrecy via per-message symmetric KDF ratchet (`RatchetSession`).
+  Old chain keys are zeroized as the chain advances, so a current-key
+  compromise cannot decrypt past traffic. Note: the *future*-secrecy half of
+  Signal's Double Ratchet (DH ratchet) is not yet implemented — closing
+  that gap requires re-keying via a fresh X25519 round each side initiates.
+- [ ] Mobile / web clients (current client is a ratatui TUI)
 
 ## Development Status
 
@@ -179,8 +183,11 @@ This implementation is for learning and experimentation. Do not use for
 sensitive communications without a thorough security audit.
 
 **Known limitations:**
-- No Perfect Forward Secrecy yet (no key rotation between sessions).
+- Forward secrecy is implemented (symmetric KDF ratchet) but the *future*-
+  secrecy DH ratchet half of Signal's Double Ratchet is not — a stolen
+  current chain key can decrypt new messages until both peers re-key.
 - The TUI client trusts any server on first connect (no key pinning yet).
+- No mobile or web client yet — only the ratatui terminal client ships.
 
 ## Operating
 

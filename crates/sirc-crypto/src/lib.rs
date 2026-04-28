@@ -6,6 +6,9 @@
 //! - BLAKE3 for key derivation
 
 pub mod keystore;
+pub mod ratchet;
+
+pub use ratchet::{RatchetMessage, RatchetSession};
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
@@ -102,6 +105,19 @@ impl SharedSecret {
         key_bytes.copy_from_slice(&hash.as_bytes()[..32]);
 
         EncryptionKey::new(key_bytes)
+    }
+
+    /// Derive raw 32-byte chain seed for the ratchet. Same hash as
+    /// `derive_key` but skips the wrapping `EncryptionKey` so callers in this
+    /// crate can feed it into the BLAKE3 keyed hasher used by the ratchet.
+    pub(crate) fn derive_chain_seed(&self, context: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.bytes);
+        hasher.update(context);
+        let hash = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hash.as_bytes()[..32]);
+        out
     }
 }
 
