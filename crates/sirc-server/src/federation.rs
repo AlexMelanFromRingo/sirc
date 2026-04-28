@@ -169,37 +169,142 @@ impl PeerConnection {
     }
 }
 
-/// Routing table for mesh network
+/// Link-state advertisement: a server's view of its directly-connected
+/// peers, broadcast periodically so every other server can build the full
+/// graph and run Dijkstra. Edges carry observed `latency_ms` so the chosen
+/// route is the *fastest*, not just the *fewest hops*.
+#[derive(Debug, Clone)]
+pub struct LinkStateAd {
+    pub origin: String,
+    /// `peer_name -> last observed RTT in ms`. `None` = unknown (cost = 50).
+    pub neighbors: HashMap<String, Option<f64>>,
+}
+
+/// Routing table for mesh network with Dijkstra-based shortest-path
+/// resolution.
 pub struct RoutingTable {
-    /// Map of server name -> peer connection
-    direct_peers: HashMap<String, Arc<PeerConnection>>,
-    /// Map of server name -> route (through which peer)
+    pub direct_peers: HashMap<String, Arc<PeerConnection>>,
+    /// LSAs from every server we've heard from (including ourselves). Used
+    /// as the link-state graph for Dijkstra.
+    lsas: HashMap<String, LinkStateAd>,
+    /// `target_server -> direct_peer_name` mapping. Recomputed whenever
+    /// the LSA database changes.
     routes: HashMap<String, String>,
+    /// Local server name; needed to root Dijkstra.
+    local_name: String,
 }
 
 impl RoutingTable {
-    pub fn new() -> Self {
+    pub fn new() -> Self { Self::new_named(String::new()) }
+
+    pub fn new_named(local_name: String) -> Self {
         Self {
             direct_peers: HashMap::new(),
+            lsas: HashMap::new(),
             routes: HashMap::new(),
+            local_name,
         }
     }
 
-    /// Add a direct peer connection
+    #[allow(dead_code)] // exposed for tests / future server-rename use cases.
+    pub fn set_local_name(&mut self, name: String) {
+        self.local_name = name;
+        self.refresh_self_lsa();
+    }
+
     pub fn add_peer(&mut self, peer: Arc<PeerConnection>) {
         let name = peer.name.clone();
         self.direct_peers.insert(name.clone(), peer);
-        self.routes.insert(name.clone(), name); // Direct route to self
+        self.routes.insert(name.clone(), name); // direct route to self
+        self.refresh_self_lsa();
+        self.recompute_routes();
     }
 
-    /// Add a route to a remote server through a peer
+    /// Legacy single-hop hint. Real routing comes from `recompute_routes()`
+    /// over the LSA graph; kept so existing callers compile.
     pub fn add_route(&mut self, server: String, via: String) {
-        if !self.routes.contains_key(&server) {
-            self.routes.insert(server, via);
+        self.routes.entry(server).or_insert(via);
+    }
+
+    /// Update the latency estimate for a directly-connected peer. Triggers
+    /// LSA refresh + route recompute.
+    pub fn update_peer_latency(&mut self, peer: &str, rtt_ms: f64) {
+        if !self.direct_peers.contains_key(peer) { return; }
+        let local = self.local_name.clone();
+        let lsa = self.lsas.entry(local.clone()).or_insert_with(|| LinkStateAd {
+            origin: local,
+            neighbors: HashMap::new(),
+        });
+        lsa.neighbors.insert(peer.to_string(), Some(rtt_ms));
+        self.recompute_routes();
+    }
+
+    /// Apply a remote server's link-state advertisement and rebuild routes.
+    pub fn apply_lsa(&mut self, lsa: LinkStateAd) {
+        self.lsas.insert(lsa.origin.clone(), lsa);
+        self.recompute_routes();
+    }
+
+    fn refresh_self_lsa(&mut self) {
+        if self.local_name.is_empty() { return; }
+        let mut ns: HashMap<String, Option<f64>> = HashMap::new();
+        for n in self.direct_peers.keys() {
+            let prev = self.lsas
+                .get(&self.local_name)
+                .and_then(|l| l.neighbors.get(n))
+                .copied()
+                .flatten();
+            ns.insert(n.clone(), prev);
+        }
+        self.lsas.insert(self.local_name.clone(), LinkStateAd {
+            origin: self.local_name.clone(),
+            neighbors: ns,
+        });
+    }
+
+    /// Build server → next-hop map from the LSA graph via Dijkstra.
+    /// Edge cost = observed latency_ms (default 50.0 when unknown).
+    fn recompute_routes(&mut self) {
+        if self.local_name.is_empty() { return; }
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        #[derive(PartialEq)]
+        struct Node { cost: f64, name: String, first_hop: Option<String> }
+        impl Eq for Node {}
+        impl PartialOrd for Node { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+        impl Ord for Node {
+            fn cmp(&self, o: &Self) -> Ordering {
+                o.cost.partial_cmp(&self.cost).unwrap_or(Ordering::Equal)
+            }
+        }
+
+        let mut routes: HashMap<String, String> = HashMap::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut heap = BinaryHeap::new();
+        heap.push(Node { cost: 0.0, name: self.local_name.clone(), first_hop: None });
+
+        while let Some(Node { cost, name, first_hop }) = heap.pop() {
+            if !visited.insert(name.clone()) { continue; }
+            if let Some(hop) = first_hop.clone() {
+                routes.insert(name.clone(), hop);
+            }
+            if let Some(lsa) = self.lsas.get(&name) {
+                for (nbr, latency) in &lsa.neighbors {
+                    if visited.contains(nbr) { continue; }
+                    let edge = latency.unwrap_or(50.0).max(1.0);
+                    let next_hop = first_hop.clone().or_else(|| Some(nbr.clone()));
+                    heap.push(Node { cost: cost + edge, name: nbr.clone(), first_hop: next_hop });
+                }
+            }
+        }
+
+        self.routes = routes;
+        for n in self.direct_peers.keys() {
+            self.routes.insert(n.clone(), n.clone());
         }
     }
 
-    /// Get the peer to route a message to a server
     pub fn get_route(&self, server: &str) -> Option<Arc<PeerConnection>> {
         self.routes
             .get(server)
@@ -207,15 +312,25 @@ impl RoutingTable {
             .cloned()
     }
 
-    /// Get all known servers
     pub fn all_servers(&self) -> Vec<String> {
-        self.routes.keys().cloned().collect()
+        let mut s: std::collections::HashSet<String> = self.routes.keys().cloned().collect();
+        s.extend(self.lsas.keys().cloned());
+        let mut v: Vec<String> = s.into_iter().collect();
+        v.sort_unstable();
+        v
     }
 
-    /// Remove a peer and all routes through it
+    /// Snapshot of our own LSA, for periodic broadcast to peers.
+    pub fn self_lsa(&self) -> Option<&LinkStateAd> {
+        self.lsas.get(&self.local_name)
+    }
+
     pub fn remove_peer(&mut self, peer_name: &str) {
         self.direct_peers.remove(peer_name);
-        self.routes.retain(|_, via| via != peer_name);
+        if let Some(lsa) = self.lsas.get_mut(&self.local_name) {
+            lsa.neighbors.remove(peer_name);
+        }
+        self.recompute_routes();
     }
 }
 
@@ -253,8 +368,8 @@ impl FederationManager {
         let (tx, rx) = mpsc::unbounded_channel();
 
         Self {
-            local_name,
-            routing: Arc::new(RwLock::new(RoutingTable::new())),
+            local_name: local_name.clone(),
+            routing: Arc::new(RwLock::new(RoutingTable::new_named(local_name))),
             channels: Arc::new(RwLock::new(HashMap::new())),
             peers: Arc::new(RwLock::new(HashMap::new())),
             partitions: Arc::new(RwLock::new(Vec::new())),
@@ -855,17 +970,55 @@ impl FederationManager {
             }
 
             Command::Raw { command, params: _ } if command == "SPONG" => {
-                // Keepalive pong — peer is alive; refresh activity.
+                // Keepalive pong — peer is alive; refresh activity + feed
+                // observed RTT into the routing table for Dijkstra weighting.
                 debug!("Received SPONG from peer {}", peer_addr);
                 let mut peers_w = peers.write().await;
+                let mut peer_name: Option<String> = None;
+                let mut latency_ms: Option<f64> = None;
                 if let Some(cfg) = peers_w.get_mut(&peer_addr.to_string()) {
                     cfg.update_last_seen();
                     cfg.last_pong_received = Some(Instant::now());
                     if let (Some(sent), Some(recvd)) = (cfg.last_ping_sent, cfg.last_pong_received) {
-                        let latency_ms = recvd.saturating_duration_since(sent).as_secs_f64() * 1000.0;
+                        let l = recvd.saturating_duration_since(sent).as_secs_f64() * 1000.0;
+                        latency_ms = Some(l);
                         let mc = Arc::clone(metrics);
-                        tokio::spawn(async move { mc.record_latency(latency_ms).await; });
+                        tokio::spawn(async move { mc.record_latency(l).await; });
                     }
+                }
+                drop(peers_w);
+                // Resolve peer's name from the routing table to update its
+                // edge weight. The routing table is keyed by server name,
+                // not address, so we look up via direct_peers iteration.
+                if latency_ms.is_some() {
+                    let routing_r = routing.read().await;
+                    for (name, p) in &routing_r.direct_peers {
+                        if p.address == peer_addr { peer_name = Some(name.clone()); break; }
+                    }
+                    drop(routing_r);
+                }
+                if let (Some(name), Some(rtt)) = (peer_name, latency_ms) {
+                    routing.write().await.update_peer_latency(&name, rtt);
+                }
+            }
+
+            Command::Raw { command, params } if command == "LSA" => {
+                // Link-state advertisement. Format:
+                //   LSA <origin> <neighbor1[:rtt]> <neighbor2[:rtt]> ...
+                // RTT is "?" when unknown.
+                if let Some(origin) = params.first() {
+                    let mut neighbors: HashMap<String, Option<f64>> = HashMap::new();
+                    for n in params.iter().skip(1) {
+                        if let Some((name, rtt)) = n.split_once(':') {
+                            let r = if rtt == "?" { None } else { rtt.parse().ok() };
+                            neighbors.insert(name.to_string(), r);
+                        } else {
+                            neighbors.insert(n.clone(), None);
+                        }
+                    }
+                    let lsa = LinkStateAd { origin: origin.clone(), neighbors };
+                    routing.write().await.apply_lsa(lsa);
+                    debug!("Federation: applied LSA from {}", origin);
                 }
             }
 
@@ -1005,6 +1158,45 @@ impl FederationManager {
 
         self.broadcast(ping_msg).await?;
         Ok(())
+    }
+
+    /// Build and broadcast a link-state advertisement so every other server
+    /// can rebuild the link-state graph and run Dijkstra over it.
+    pub async fn send_lsa(&self) -> Result<()> {
+        let routing = self.routing.read().await;
+        let lsa = match routing.self_lsa() {
+            Some(l) if !l.neighbors.is_empty() => l.clone(),
+            _ => return Ok(()), // no peers to advertise
+        };
+        drop(routing);
+        let mut params = vec![lsa.origin];
+        for (n, rtt) in lsa.neighbors {
+            let s = match rtt {
+                Some(ms) => format!("{}:{:.2}", n, ms),
+                None => format!("{}:?", n),
+            };
+            params.push(s);
+        }
+        let msg = FederatedMessage {
+            origin_server: self.local_name.clone(),
+            target_server: None,
+            payload: Message::new(Command::Raw { command: "LSA".to_string(), params }),
+        };
+        self.broadcast(msg).await
+    }
+
+    /// Periodic LSA broadcast — every 60 s. Allows the cluster to converge
+    /// on shortest-path routes within a couple of intervals.
+    pub fn start_lsa_broadcast_task(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.send_lsa().await {
+                    warn!("LSA broadcast failed: {}", e);
+                }
+            }
+        });
     }
 
     /// Start keepalive task (call once during server initialization)

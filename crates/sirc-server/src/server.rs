@@ -83,6 +83,10 @@ impl Server {
             Arc::clone(federation).start_keepalive_task();
             info!("Keepalive task started (30s interval)");
 
+            // Start LSA broadcast for link-state-based shortest-path routing
+            Arc::clone(federation).start_lsa_broadcast_task();
+            info!("LSA broadcast task started (60s interval)");
+
             // Start auto-reconnect task
             Arc::clone(federation).start_reconnect_task();
             info!("Auto-reconnect task started (5s check interval)");

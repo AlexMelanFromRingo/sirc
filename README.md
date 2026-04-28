@@ -155,9 +155,12 @@ BURST / BURST_END                # State synchronization
 - Certificate Revocation List (CRL) ✅
 
 ### What's Next
-- Perfect Forward Secrecy (key rotation)
-- Advanced routing algorithms
-- Mobile/web clients
+- ✅ Perfect Forward Secrecy (per-message KDF ratchet + explicit
+  X25519 `rekey()` triggered every 50 messages — see crypto section above)
+- ✅ Advanced routing — link-state advertisements broadcast every 60 s,
+  Dijkstra shortest-path computed over the resulting graph with
+  latency-weighted edges (SPING/SPONG RTT becomes the edge cost).
+- Mobile/web clients (Tauri 2 is the current plan)
 
 ## Testing
 
