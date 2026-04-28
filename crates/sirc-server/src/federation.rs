@@ -230,7 +230,9 @@ pub struct FederationManager {
     tls: Option<Arc<TlsManager>>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
-    message_rx: mpsc::UnboundedReceiver<FederatedMessage>,
+    /// Wrapped in `Mutex<Option<...>>` because the receiver must be moved
+    /// into the router task once. After `start_router_task` runs, this is `None`.
+    message_rx: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<FederatedMessage>>>,
     message_tx: mpsc::UnboundedSender<FederatedMessage>,
     clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
 }
@@ -260,7 +262,7 @@ impl FederationManager {
             tls: None,
             tls_acceptor: None,
             tls_connector: None,
-            message_rx: rx,
+            message_rx: tokio::sync::Mutex::new(Some(rx)),
             message_tx: tx,
             clients,
         }
@@ -269,6 +271,46 @@ impl FederationManager {
     /// Get metrics collector reference
     pub fn metrics(&self) -> Arc<MetricsCollector> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Start the central router task. Must be called once during startup;
+    /// subsequent calls are no-ops. The router consumes `FederatedMessage`
+    /// values produced via `get_sender()` and dispatches them based on
+    /// `origin_server` / `target_server` (broadcast or unicast through
+    /// `route_to`). This lets non-federation code (e.g. server admin
+    /// hooks) inject federated traffic without holding the routing mutex.
+    pub async fn start_router_task(self: &Arc<Self>) {
+        let mut guard = self.message_rx.lock().await;
+        let rx = match guard.take() {
+            Some(r) => r,
+            None => return, // already started
+        };
+        drop(guard);
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(msg) = rx.recv().await {
+                me.metrics.increment_messages_routed();
+                debug!(
+                    "router: dispatching message from {} target={:?}",
+                    msg.origin_server, msg.target_server
+                );
+                match &msg.target_server {
+                    None => {
+                        if let Err(e) = me.broadcast(msg).await {
+                            warn!("router broadcast failed: {}", e);
+                        }
+                    }
+                    Some(server) => {
+                        let server = server.clone();
+                        if let Err(e) = me.route_to(&server, msg).await {
+                            warn!("router route_to({}) failed: {}", server, e);
+                        }
+                    }
+                }
+            }
+            warn!("federation router task exiting (sender closed)");
+        });
     }
 
     /// Start metrics reporting task
@@ -304,11 +346,6 @@ impl FederationManager {
         Ok(self)
     }
 
-    /// Get a message sender for other components
-    pub fn get_sender(&self) -> mpsc::UnboundedSender<FederatedMessage> {
-        self.message_tx.clone()
-    }
-
     /// Start federation listener
     pub async fn listen(&self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
@@ -318,6 +355,8 @@ impl FederationManager {
         let routing = Arc::clone(&self.routing);
         let channels = Arc::clone(&self.channels);
         let clients = Arc::clone(&self.clients);
+        let peers = Arc::clone(&self.peers);
+        let metrics = Arc::clone(&self.metrics);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
         let tls_acceptor = self.tls_acceptor.clone();
@@ -327,9 +366,12 @@ impl FederationManager {
                 match listener.accept().await {
                     Ok((socket, addr)) => {
                         info!("Incoming federation connection from {}", addr);
+                        metrics.increment_active_connections();
                         let routing = Arc::clone(&routing);
                         let channels = Arc::clone(&channels);
                         let clients = Arc::clone(&clients);
+                        let peers = Arc::clone(&peers);
+                        let metrics_inner = Arc::clone(&metrics);
                         let local_name = local_name.clone();
                         let message_tx = message_tx.clone();
                         let tls_acceptor = tls_acceptor.clone();
@@ -340,10 +382,13 @@ impl FederationManager {
                                 match acceptor.accept(socket).await {
                                     Ok(tls_stream) => {
                                         info!("TLS handshake completed with {}", addr);
+                                        metrics_inner.increment_tls_success();
                                         FederationStream::TlsServer(Box::new(tls_stream))
                                     }
                                     Err(e) => {
                                         error!("TLS handshake failed with {}: {}", addr, e);
+                                        metrics_inner.increment_tls_failed();
+                                        metrics_inner.decrement_active_connections();
                                         return;
                                     }
                                 }
@@ -357,6 +402,8 @@ impl FederationManager {
                                 routing,
                                 channels,
                                 clients,
+                                peers,
+                                Arc::clone(&metrics_inner),
                                 local_name,
                                 message_tx,
                             )
@@ -364,6 +411,7 @@ impl FederationManager {
                             {
                                 error!("Error handling incoming peer: {}", e);
                             }
+                            metrics_inner.decrement_active_connections();
                         });
                     }
                     Err(e) => {
@@ -386,7 +434,13 @@ impl FederationManager {
             PeerConfig::new(address.to_string()),
         );
 
-        let tcp_stream = TcpStream::connect(address).await?;
+        let tcp_stream = match TcpStream::connect(address).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.metrics.increment_failed_connections();
+                return Err(e.into());
+            }
+        };
         let addr = tcp_stream.peer_addr()?;
 
         // Wrap with TLS if enabled
@@ -402,6 +456,8 @@ impl FederationManager {
                 }
                 Err(e) => {
                     error!("TLS handshake failed with {}: {}", address, e);
+                    self.metrics.increment_tls_failed();
+                    self.metrics.increment_failed_connections();
                     return Err(e.into());
                 }
             }
@@ -413,29 +469,40 @@ impl FederationManager {
         let channels = Arc::clone(&self.channels);
         let clients = Arc::clone(&self.clients);
         let peers = Arc::clone(&self.peers);
+        let metrics = Arc::clone(&self.metrics);
         let local_name = self.local_name.clone();
         let message_tx = self.message_tx.clone();
         let peer_address = address.to_string();
 
-        tokio::spawn(async move {
-            if let Err(e) = Self::handle_outgoing_peer(
-                stream,
-                addr,
-                routing,
-                channels,
-                clients,
-                local_name,
-                message_tx,
-            )
-            .await
-            {
-                error!("Error handling outgoing peer {}: {}", peer_address, e);
+        self.metrics.increment_active_connections();
+        if self.tls_connector.is_some() {
+            self.metrics.increment_tls_success();
+        }
 
-                // Mark peer as disconnected
-                if let Some(config) = peers.write().await.get_mut(&peer_address) {
-                    config.connected = false;
-                    info!("Peer {} marked for reconnection", peer_address);
+        tokio::spawn({
+            let peers_outer = Arc::clone(&peers);
+            let metrics_outer = Arc::clone(&metrics);
+            async move {
+                if let Err(e) = Self::handle_outgoing_peer(
+                    stream,
+                    addr,
+                    routing,
+                    channels,
+                    clients,
+                    peers,
+                    metrics,
+                    local_name,
+                    message_tx,
+                )
+                .await
+                {
+                    error!("Error handling outgoing peer {}: {}", peer_address, e);
+                    if let Some(config) = peers_outer.write().await.get_mut(&peer_address) {
+                        config.connected = false;
+                        info!("Peer {} marked for reconnection", peer_address);
+                    }
                 }
+                metrics_outer.decrement_active_connections();
             }
         });
 
@@ -455,6 +522,8 @@ impl FederationManager {
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
         clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
+        peers: Arc<RwLock<HashMap<String, PeerConfig>>>,
+        metrics: Arc<MetricsCollector>,
         local_name: String,
         _message_tx: mpsc::UnboundedSender<FederatedMessage>,
     ) -> Result<()> {
@@ -515,7 +584,7 @@ impl FederationManager {
                 while let Some(result) = reader.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_peer_message(message, &routing, &channels, &clients).await?;
+                            Self::handle_peer_message(message, addr, &routing, &channels, &clients, &peers, &metrics).await?;
                         }
                         Err(e) => {
                             warn!("Error receiving from peer: {}", e);
@@ -536,6 +605,8 @@ impl FederationManager {
         routing: Arc<RwLock<RoutingTable>>,
         channels: Arc<RwLock<HashMap<String, ChannelState>>>,
         clients: Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
+        peers: Arc<RwLock<HashMap<String, PeerConfig>>>,
+        metrics: Arc<MetricsCollector>,
         local_name: String,
         _message_tx: mpsc::UnboundedSender<FederatedMessage>,
     ) -> Result<()> {
@@ -576,7 +647,7 @@ impl FederationManager {
                     if Self::is_burst_end(&msg) {
                         break;
                     }
-                    Self::handle_peer_message(msg, &routing, &channels, &clients).await?;
+                    Self::handle_peer_message(msg, addr, &routing, &channels, &clients, &peers, &metrics).await?;
                 }
 
                 // Send our BURST
@@ -601,7 +672,7 @@ impl FederationManager {
                 while let Some(result) = reader.next().await {
                     match result {
                         Ok(message) => {
-                            Self::handle_peer_message(message, &routing, &channels, &clients).await?;
+                            Self::handle_peer_message(message, addr, &routing, &channels, &clients, &peers, &metrics).await?;
                         }
                         Err(e) => {
                             warn!("Error from peer: {}", e);
@@ -622,14 +693,22 @@ impl FederationManager {
     ) -> Result<()> {
         let channels_lock = channels.read().await;
 
-        for (channel_name, state) in channels_lock.iter() {
+        for (_, state) in channels_lock.iter() {
+            // Iterate by ChannelState so the per-channel topic comes along too.
             let users: Vec<String> = state.users.keys().cloned().collect();
             if !users.is_empty() {
                 let sjoin = Message::new(Command::Raw {
                     command: "SJOIN".to_string(),
-                    params: vec![channel_name.clone(), users.join(",")],
+                    params: vec![state.name.clone(), users.join(",")],
                 });
                 framed.send(sjoin).await?;
+            }
+            if let Some(ref topic) = state.topic {
+                let stopic = Message::new(Command::Raw {
+                    command: "STOPIC".to_string(),
+                    params: vec![state.name.clone(), topic.clone()],
+                });
+                framed.send(stopic).await?;
             }
         }
 
@@ -651,23 +730,18 @@ impl FederationManager {
         )
     }
 
-    /// Send a federated message
-    async fn send_federated_message(
-        framed: &mut Framed<FederationStream, IrcCodec>,
-        msg: FederatedMessage,
-    ) -> Result<()> {
-        framed.send(msg.payload).await?;
-        Ok(())
-    }
-
     /// Handle message from peer
     async fn handle_peer_message(
         message: Message,
+        peer_addr: SocketAddr,
         routing: &Arc<RwLock<RoutingTable>>,
         channels: &Arc<RwLock<HashMap<String, ChannelState>>>,
         clients: &Arc<RwLock<HashMap<String, Arc<crate::client::Client>>>>,
+        peers: &Arc<RwLock<HashMap<String, PeerConfig>>>,
+        metrics: &Arc<MetricsCollector>,
     ) -> Result<()> {
         debug!("Federation message: {:?}", message.command);
+        metrics.increment_messages_received();
 
         match &message.command {
             Command::Server {
@@ -682,6 +756,23 @@ impl FederationManager {
                 );
                 // Add route in routing table
                 routing.write().await.add_route(name.clone(), name.clone());
+            }
+
+            Command::Raw { command, params } if command == "STOPIC" => {
+                if params.len() >= 2 {
+                    let channel_name = &params[0];
+                    let topic = params[1].clone();
+                    let mut chans = channels.write().await;
+                    let st = chans
+                        .entry(channel_name.clone())
+                        .or_insert_with(|| ChannelState {
+                            name: channel_name.clone(),
+                            users: HashMap::new(),
+                            topic: None,
+                        });
+                    st.topic = Some(topic);
+                    info!("Federation: topic for {} synced", st.name);
+                }
             }
 
             Command::Raw { command, params } if command == "SJOIN" => {
@@ -754,14 +845,28 @@ impl FederationManager {
             }
 
             Command::Raw { command, params: _ } if command == "SPING" => {
-                // Keepalive ping from peer
-                debug!("Received SPING from peer");
-                // Response handled by sender task
+                // Keepalive ping from peer — record activity.
+                debug!("Received SPING from peer {}", peer_addr);
+                let mut peers_w = peers.write().await;
+                if let Some(cfg) = peers_w.get_mut(&peer_addr.to_string()) {
+                    cfg.update_last_seen();
+                    cfg.last_ping_sent = Some(Instant::now());
+                }
             }
 
             Command::Raw { command, params: _ } if command == "SPONG" => {
-                // Keepalive pong from peer
-                debug!("Received SPONG from peer");
+                // Keepalive pong — peer is alive; refresh activity.
+                debug!("Received SPONG from peer {}", peer_addr);
+                let mut peers_w = peers.write().await;
+                if let Some(cfg) = peers_w.get_mut(&peer_addr.to_string()) {
+                    cfg.update_last_seen();
+                    cfg.last_pong_received = Some(Instant::now());
+                    if let (Some(sent), Some(recvd)) = (cfg.last_ping_sent, cfg.last_pong_received) {
+                        let latency_ms = recvd.saturating_duration_since(sent).as_secs_f64() * 1000.0;
+                        let mc = Arc::clone(metrics);
+                        tokio::spawn(async move { mc.record_latency(latency_ms).await; });
+                    }
+                }
             }
 
             _ => {
@@ -775,33 +880,32 @@ impl FederationManager {
     /// Broadcast a message to all peers
     pub async fn broadcast(&self, msg: FederatedMessage) -> Result<()> {
         let routing = self.routing.read().await;
-
+        let mut sent = 0u64;
         for peer in routing.direct_peers.values() {
             if let Err(e) = peer.send(msg.clone()) {
                 warn!("Failed to broadcast to {}: {}", peer.name, e);
+            } else {
+                sent += 1;
             }
         }
-
+        for _ in 0..sent {
+            self.metrics.increment_messages_sent();
+        }
         Ok(())
     }
 
     /// Route a message to a specific server
     pub async fn route_to(&self, server: &str, msg: FederatedMessage) -> Result<()> {
         let routing = self.routing.read().await;
-
         if let Some(peer) = routing.get_route(server) {
             peer.send(msg)?;
+            self.metrics.increment_messages_sent();
         } else {
             warn!("No route to server: {}", server);
         }
-
         Ok(())
     }
 
-    /// Get list of all known servers
-    pub async fn get_servers(&self) -> Vec<String> {
-        self.routing.read().await.all_servers()
-    }
 
     /// Join a federated channel
     pub async fn join_channel(&self, channel: String, user: String) -> Result<()> {
@@ -963,6 +1067,7 @@ impl FederationManager {
                     address, config.retry_count, config.max_retries
                 );
             }
+            self.metrics.increment_reconnection_attempt();
 
             // Attempt reconnection
             match TcpStream::connect(&address).await {
@@ -1007,11 +1112,20 @@ impl FederationManager {
                     let channels = Arc::clone(&self.channels);
                     let clients = Arc::clone(&self.clients);
                     let peers = Arc::clone(&self.peers);
+                    let metrics = Arc::clone(&self.metrics);
                     let local_name = self.local_name.clone();
                     let message_tx = self.message_tx.clone();
                     let peer_address = address.clone();
 
+                    metrics.increment_reconnection_success();
+                    metrics.increment_active_connections();
+                    if self.tls_connector.is_some() {
+                        metrics.increment_tls_success();
+                    }
+
                     // Spawn handler task
+                    let peers_outer = Arc::clone(&peers);
+                    let metrics_outer = Arc::clone(&metrics);
                     tokio::spawn(async move {
                         if let Err(e) = Self::handle_outgoing_peer(
                             stream,
@@ -1019,6 +1133,8 @@ impl FederationManager {
                             routing,
                             channels,
                             clients,
+                            peers,
+                            metrics,
                             local_name,
                             message_tx,
                         )
@@ -1027,14 +1143,16 @@ impl FederationManager {
                             error!("Error after reconnecting to {}: {}", peer_address, e);
 
                             // Mark as disconnected again
-                            if let Some(config) = peers.write().await.get_mut(&peer_address) {
+                            if let Some(config) = peers_outer.write().await.get_mut(&peer_address) {
                                 config.connected = false;
                             }
                         }
+                        metrics_outer.decrement_active_connections();
                     });
                 }
                 Err(e) => {
                     warn!("Failed to reconnect to {}: {}", address, e);
+                    self.metrics.increment_failed_connections();
 
                     // Check if max retries reached
                     if let Some(config) = self.peers.read().await.get(&address) {
@@ -1042,6 +1160,10 @@ impl FederationManager {
                             error!(
                                 "Max reconnection attempts reached for {}. Giving up.",
                                 address
+                            );
+                            info!(
+                                "Giving up on peer with stored address {}",
+                                config.address
                             );
                         }
                     }
@@ -1146,13 +1268,6 @@ impl FederationManager {
         self.partitions.read().await.clone()
     }
 
-    /// Update peer activity timestamp (called on receiving SPONG)
-    pub async fn update_peer_activity(&self, peer_address: &str) {
-        if let Some(config) = self.peers.write().await.get_mut(peer_address) {
-            config.update_last_seen();
-            config.last_pong_received = Some(Instant::now());
-        }
-    }
 }
 
 impl Default for RoutingTable {

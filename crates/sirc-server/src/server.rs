@@ -75,6 +75,10 @@ impl Server {
             federation.listen(addr).await?;
             info!("Federation enabled on port {}", fed_port);
 
+            // Start central router task
+            federation.start_router_task().await;
+            info!("Federation router task started");
+
             // Start keepalive task
             Arc::clone(federation).start_keepalive_task();
             info!("Keepalive task started (30s interval)");

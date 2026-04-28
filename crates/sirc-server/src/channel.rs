@@ -32,4 +32,9 @@ impl Channel {
     pub fn set_topic(&mut self, topic: Option<String>) {
         self.topic = topic;
     }
+
+    /// Channel name (for diagnostics / logging).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }

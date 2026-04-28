@@ -398,7 +398,7 @@ impl ClientHandler {
             channel.add_member(nick.clone());
 
             info!("Channel '{}' now has {} members: {:?}",
-                  channel_name, channel.members.len(), channel.members);
+                  channel.name(), channel.members.len(), channel.members);
             drop(channels);
 
             // Notify federation if enabled
@@ -753,6 +753,33 @@ impl ClientHandler {
                     ));
                 }
             }
+            // Network partitions and live performance metrics.
+            let partitions = federation.get_partition_status().await;
+            lines.push(format!("partitions active={}", partitions.len()));
+            for p in &partitions {
+                lines.push(format!(
+                    "partition {} unreachable={} detected_at_age_secs={}",
+                    p.id,
+                    p.unreachable_servers.len(),
+                    p.detected_at.elapsed().as_secs()
+                ));
+            }
+            let snap = federation.metrics().snapshot().await;
+            lines.push(format!(
+                "metrics msgs_sent={} msgs_recv={} msgs_routed={} encrypted={} active_conn={} tls_ok={} tls_fail={} reconn_ok={}",
+                snap.messages_sent,
+                snap.messages_received,
+                snap.messages_routed,
+                snap.encrypted_messages,
+                snap.active_connections,
+                snap.tls_handshakes_success,
+                snap.tls_handshakes_failed,
+                snap.reconnections_successful,
+            ));
+            lines.push(format!(
+                "latency_ms avg={:.2} min={:.2} max={:.2}",
+                snap.avg_latency_ms, snap.min_latency_ms, snap.max_latency_ms
+            ));
         }
 
         // 211 RPL_STATSLINKINFO + 219 RPL_ENDOFSTATS — IRC convention.
@@ -979,6 +1006,9 @@ impl ClientHandler {
         let nick = client.nick.read().await.clone().unwrap_or_default();
 
         info!("Routing encrypted message from {} to {}", nick, target);
+        if let Some(ref federation) = state.federation {
+            federation.metrics().increment_encrypted_messages();
+        }
 
         // For true E2E encryption, server should NOT decrypt
         // Simply route the encrypted message to the target client
