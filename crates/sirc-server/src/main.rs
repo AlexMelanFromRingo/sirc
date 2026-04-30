@@ -37,8 +37,9 @@ struct Cli {
     /// Enable TLS for federation (requires --federate)
     #[arg(long)]
     tls: bool,
-    /// Peer servers to connect to (format: host:port)
-    #[arg(long)]
+    /// Peer servers to connect to (format: host:port). Comma-separated
+    /// or repeat the flag — both are accepted.
+    #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 }
 
@@ -78,7 +79,7 @@ struct ServeArgs {
     federate: bool,
     #[arg(long)]
     tls: bool,
-    #[arg(long)]
+    #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 }
 
